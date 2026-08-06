@@ -32,6 +32,26 @@ def init_instance():
 
 
 # ==================== 系统瘦身（省资源） ====================
+
+
+def _tune_network():
+    """内核参数优化：提升网络发送性能（打满带宽/高pps）"""
+    cmds = [
+        "sudo sysctl -w net.core.wmem_default=67108864 2>/dev/null",
+        "sudo sysctl -w net.core.rmem_default=67108864 2>/dev/null",
+        "sudo sysctl -w net.core.netdev_max_backlog=65536 2>/dev/null",
+        "sudo sysctl -w net.ipv4.ip_local_port_range='1024 65535' 2>/dev/null",
+        "sudo sysctl -w net.ipv4.tcp_wmem='4096 87380 67108864' 2>/dev/null",
+        "sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 67108864' 2>/dev/null",
+    ]
+    for c in cmds:
+        try:
+            subprocess.run(c, shell=True, timeout=5)
+        except Exception:
+            pass
+    print("[tune] 网络内核参数已优化", flush=True)
+
+
 def _system_trim():
     """停用云环境用不到的服务，节省资源。已实测不影响功能。"""
     services = [
@@ -527,6 +547,7 @@ def run():
     _save_prev_backup()
     _write_shell_profile()
     threading.Thread(target=_system_trim, daemon=True).start()
+    _tune_network()
     _run_setup()
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)

@@ -51,6 +51,7 @@ func statsLoop() {
 
 // ==================== UDP Flood ====================
 func udpWorker(c *net.UDPConn, packet []byte, deadline time.Time, stopCh chan bool) {
+	var localPPS, localBytes int64
 	for {
 		select {
 		case <-stopCh:
@@ -62,8 +63,13 @@ func udpWorker(c *net.UDPConn, packet []byte, deadline time.Time, stopCh chan bo
 		}
 		n, err := c.Write(packet)
 		if err == nil {
-			atomic.AddInt64(&statBytes, int64(n))
-			atomic.AddInt64(&statPPS, 1)
+			localPPS++
+			localBytes += int64(n)
+			if localPPS >= 1024 {
+				atomic.AddInt64(&statPPS, localPPS)
+				atomic.AddInt64(&statBytes, localBytes)
+				localPPS, localBytes = 0, 0
+			}
 		}
 	}
 }
