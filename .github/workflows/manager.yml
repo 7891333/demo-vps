@@ -51,4 +51,5 @@ jobs:
           MANAGER_WORKFLOW: "manager.yml"
           WORKER_WORKFLOW: "worker.yml"
           PRE_WAKE_SECONDS: "21300"
+          CURRENT_SHA: ${{ github.sha }}
         run: python3 app.py

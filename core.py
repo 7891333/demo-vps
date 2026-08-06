@@ -332,3 +332,30 @@ def pre_wake_loop(token=None, workflow=None):
                 print(f"[prewake] 触发失败: {e}", flush=True)
             break
         time.sleep(60)
+
+
+# ==================== 自动更新（帝国自动化） ====================
+def auto_update_loop(workflow, instance_id=None, token=None):
+    """定期检查主仓库版本，发现新版本则触发滚动重启，随后退出自己"""
+    current_sha = config.CURRENT_SHA
+    if not current_sha:
+        print("[update] 未设置 CURRENT_SHA，自动更新禁用", flush=True)
+        return
+    while True:
+        time.sleep(300)  # 每 5 分钟检查
+        try:
+            url = f"https://api.github.com/repos/{config.MAIN_REPO}/commits/main"
+            status, d = gh_request("GET", url, token=token)
+            latest = d.get("sha", "")
+            if latest and latest != current_sha:
+                print(f"[update] 检测到新版本 {latest[:10]} != {current_sha[:10]}，滚动重启", flush=True)
+                trigger_url = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{workflow}/dispatches"
+                data = {"ref": "main"}
+                if instance_id:
+                    data["inputs"] = {"INSTANCE_ID": instance_id}
+                status2, _ = gh_request("POST", trigger_url, token=token, data=data)
+                print(f"[update] 已触发新实例 (HTTP {status2})，60 秒后旧实例退出", flush=True)
+                time.sleep(60)
+                os._exit(0)
+        except Exception as e:
+            print(f"[update] 检查失败: {e}", flush=True)

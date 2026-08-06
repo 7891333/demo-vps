@@ -54,6 +54,7 @@ SESSION = _load_session()
 def api(method, url, data=None, timeout=60):
     """请求 manager API，返回 dict"""
     h = {"Content-Type": "application/json",
+         "Authorization": f"Bearer {TOKEN}",
          "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, method=method, headers=h, data=body)

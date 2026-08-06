@@ -64,3 +64,9 @@ WORKER_WORKFLOW = os.environ.get("WORKER_WORKFLOW", "worker.yml")
 TUNNEL_PREFIX = os.environ.get("TUNNEL_PREFIX", "ghost")
 # 管理实例固定域名
 MANAGER_HOST = os.environ.get("MANAGER_HOST", "manager.kekeke.cc.cd")
+
+# ==================== 自动更新 ====================
+# 主仓库（上游），用于版本对比和 fork 同步
+MAIN_REPO = os.environ.get("MAIN_REPO", "7891333/demo-vps")
+# 当前 checkout 的 commit SHA（由 workflow 传入）
+CURRENT_SHA = os.environ.get("CURRENT_SHA", "")

@@ -317,6 +317,36 @@ def _worker_pre_wake():
         time.sleep(60)
 
 
+
+
+def _auto_update_loop():
+    """自动更新：定期检查主仓库版本，新版本则同步fork+滚动重启"""
+    current_sha = config.CURRENT_SHA
+    if not current_sha:
+        return
+    while True:
+        time.sleep(300)
+        try:
+            url = f"https://api.github.com/repos/{config.MAIN_REPO}/commits/main"
+            status, d = core.gh_request("GET", url)
+            latest = d.get("sha", "")
+            if latest and latest != current_sha:
+                print(f"[update] 检测到新版本 {latest[:10]}，同步fork+滚动重启", flush=True)
+                try:
+                    url2 = f"https://api.github.com/repos/{config.REPO}/merge-upstream"
+                    core.gh_request("POST", url2, data={"branch": "main"})
+                    time.sleep(5)
+                except Exception as e:
+                    print(f"[update] fork同步失败: {e}", flush=True)
+                url3 = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{config.WORKER_WORKFLOW}/dispatches"
+                core.gh_request("POST", url3, data={"ref": "main", "inputs": {"INSTANCE_ID": config.INSTANCE_ID}})
+                print("[update] 已触发新 worker，60秒后旧实例退出", flush=True)
+                time.sleep(60)
+                os._exit(0)
+        except Exception as e:
+            print(f"[update] 检查失败: {e}", flush=True)
+
+
 def _start_tunnel():
     if not config.TUNNEL_TOKEN:
         print("[tunnel] 无 tunnel token，跳过", flush=True)
@@ -361,5 +391,6 @@ def run():
     threading.Thread(target=_start_tunnel, daemon=True).start()
     threading.Thread(target=_report_running, daemon=True).start()
     threading.Thread(target=_worker_pre_wake, daemon=True).start()
+    threading.Thread(target=_auto_update_loop, daemon=True).start()
     terminal.start_cleanup()
     socketio.run(app, host="0.0.0.0", port=config.PORT, allow_unsafe_werkzeug=True)
