@@ -315,7 +315,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
   </div>
   <div class="card">
     <div class="label">数据来源</div>
-    <div class="val" style="font-size:15px">{{ source }}</div>
+    <div class="val" style="font-size:15px">{{ data_source }}</div>
     <div class="sub">从 Releases 解密恢复</div>
   </div>
 </div>
@@ -383,7 +383,7 @@ def index():
     conn.close()
     return render_template_string(
         HTML, job_id=JOB_ID, elapsed=elapsed_str(elapsed_seconds()), visits=v,
-        source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL,
+        data_source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL,
     )
 
 
