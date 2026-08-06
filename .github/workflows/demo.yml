@@ -43,4 +43,4 @@ jobs:
           HEARTBEAT_INTERVAL: "30"
           HEARTBEAT_TIMEOUT: "90"
         run: |
-          python3 demo_server.py
+          python3 app.py

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Actions 加密持久化演示</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="wrap">
+  <header class="header">
+    <div class="header-top">
+      <span class="badge {{ 'badge-green' if is_leader else 'badge-orange' }}">
+        {{ 'LEADER 主节点' if is_leader else 'FOLLOWER 备份节点' }}
+      </span>
+      <span class="badge badge-outline">AES-256-GCM</span>
+    </div>
+    <h1 class="header-title">GitHub Actions 临时环境演示</h1>
+    <p class="header-desc">利用 GitHub Actions 定时唤醒 + Releases 永久存储，实现无需本地守护进程的自动续传与数据加密持久化。</p>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-label">当前 Job</div>
+      <div class="card-val">{{ job_id }}</div>
+      <div class="card-sub">每次唤醒随机生成</div>
+    </div>
+    <div class="card">
+      <div class="card-label">运行时长</div>
+      <div class="card-val" id="elapsed" data-sec="{{ elapsed_sec }}">{{ elapsed }}</div>
+      <div class="card-sub">本次 job 已运行</div>
+    </div>
+    <div class="card">
+      <div class="card-label">访问次数</div>
+      <div class="card-val">{{ visits }}</div>
+      <div class="card-sub">跨 job 累计，加密持久化</div>
+    </div>
+    <div class="card">
+      <div class="card-label">数据来源</div>
+      <div class="card-val card-val-sm">{{ data_source }}</div>
+      <div class="card-sub">从 Releases 解密恢复</div>
+    </div>
+  </div>
+
+  <section class="section">
+    <h2 class="section-title"><span class="dot"></span>留言板（数据持久化验证）</h2>
+    <p class="section-hint">
+      在这里添加留言，数据会被 AES 加密后上传到 GitHub Releases，即使 job 销毁，下次唤醒也会自动恢复。
+      {{ '主节点可写入' if is_leader else '当前为备份节点（只读），leader 切换后恢复写入' }}
+    </p>
+    <ul class="list" id="msglist">
+      {% for m in messages %}
+      <li><span class="list-t">{{ m.content }}</span><span class="list-d">{{ m.created_at }}</span></li>
+      {% else %}
+      <li><span class="list-t list-empty">暂无留言，来添加第一条吧</span></li>
+      {% endfor %}
+    </ul>
+    <div class="form-row">
+      <input id="content" placeholder="输入留言内容..." maxlength="200" {{ '' if is_leader else 'disabled' }}>
+      <button id="add-btn" {{ '' if is_leader else 'disabled' }}>添加</button>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2 class="section-title"><span class="dot"></span>安全与备份机制</h2>
+    <ul class="list">
+      <li><span class="list-t">加密算法</span><span class="list-d enc"><span class="lock"></span> AES-256-GCM</span></li>
+      <li><span class="list-t">密钥存储</span><span class="list-d">GitHub Secrets（不落盘）</span></li>
+      <li><span class="list-t">备份位置</span><span class="list-d">GitHub Releases</span></li>
+      <li><span class="list-t">自动备份间隔</span><span class="list-d">{{ backup_interval }} 秒</span></li>
+      <li><span class="list-t">job 生命周期</span><span class="list-d">~6 小时 · 无缝衔接 · 主job锁</span></li>
+      <li><span class="list-t">文件持久化</span><span class="list-d">files/ 目录自动备份</span></li>
+    </ul>
+  </section>
+
+  <footer class="foot">Job ID <span class="mono">{{ job_id }}</span> · 数据加密后存于 Releases，仓库公开亦安全</footer>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

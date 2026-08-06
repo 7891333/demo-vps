@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitHub Actions 云端交互式终端客户端（类 SSH 体验）
+GitHub Actions 云端交互式终端客户端（类 SSH）
 
 特性：
-- 自动重连（断线后自动恢复，无感）
-- 会话保持（固定 session_id，重连后云端 bash 状态/历史/运行中命令不丢失）
-- 批量发送 bytes（修复中文乱码与粘贴截断）
-- 支持 vi / top / htop 等交互程序（PTY 伪终端）
+- 交互式 bash 终端（PTY），支持 vi/top 等全屏程序
+- 自动重连：断线后指数退避自动重连，保持同一会话（bash 历史、运行中命令不丢）
+- 会话持久化：session_key 存本地，重连复用同一 PTY
 
 用法：
   python3 ghvss_cli.py <EXEC_TOKEN>
-  # 或通过环境变量
   EXEC_TOKEN=xxx python3 ghvss_cli.py
 """
 import os
 import sys
 import tty
+import time
 import uuid
-import threading
+import struct
+import fcntl
 import termios
+import threading
+
 import socketio
 
 URL = os.environ.get("GHVPS_URL", "https://ghvps.kekeke.cc.cd")
@@ -27,28 +29,28 @@ TOKEN = os.environ.get("EXEC_TOKEN", "")
 SESSION_FILE = os.path.expanduser("~/.ghvps_session")
 
 
-def get_session_id():
-    """获取固定 session_id（存本地文件，保证重连复用同一云端会话）"""
-    try:
-        if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE) as f:
-                sid = f.read().strip()
-                if sid:
-                    return sid
-        sid = uuid.uuid4().hex[:12]
-        with open(SESSION_FILE, "w") as f:
-            f.write(sid)
-        return sid
-    except Exception:
-        return "default"
+def _load_session():
+    """读取或创建持久化 session_key（保证重连复用同一会话）"""
+    if os.path.exists(SESSION_FILE):
+        with open(SESSION_FILE) as f:
+            k = f.read().strip()
+            if k:
+                return k
+    k = uuid.uuid4().hex
+    with open(SESSION_FILE, "w") as f:
+        f.write(k)
+    return k
 
 
-# 自动重连：reconnection=True，无限重试，2s起步指数退避
+SESSION = _load_session()
+
+# 自动重连：reconnection_attempts=0 表示无限重连，指数退避
 sio = socketio.Client(
     reconnection=True,
     reconnection_attempts=0,
-    reconnection_delay=2,
-    reconnection_delay_max=10,
+    reconnection_delay=1,
+    reconnection_delay_max=3,
+    randomization_factor=0.2,
 )
 
 
@@ -65,26 +67,32 @@ def on_exit(data):
 
 @sio.event
 def connect():
-    sys.stderr.write("\r\n[已连接云端终端] 输入 exit 或 Ctrl+D 退出\r\n")
+    # 连接后发送当前终端窗口大小
+    try:
+        rows, cols = struct.unpack(
+            "HHHH", fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0\0\0\0\0\0\0\0")
+        )[:2]
+        sio.emit("resize", {"rows": rows, "cols": cols})
+    except Exception:
+        pass
+    sys.stderr.write("\r\n[已连接云端终端] 断线自动重连，会话保持\r\n")
     sys.stderr.flush()
 
 
 @sio.event
 def disconnect():
-    # 自动重连由 socketio 处理，这里只提示（不退出）
     sys.stderr.write("\r\n[连接断开，自动重连中...]\r\n")
     sys.stderr.flush()
 
 
-def send_loop():
-    """批量读取 stdin 并发送（发送 bytes，避免乱码/截断）"""
+def _send_loop():
+    """读取本地 stdin 逐字节发送"""
     try:
         while True:
-            data = os.read(0, 4096)  # 批量读，raw 模式下粘贴会整段返回
-            if not data:
+            ch = os.read(0, 1)
+            if not ch:
                 break
-            if sio.connected:
-                sio.emit("input", data)  # 直接发 bytes
+            sio.emit("input", ch.decode(errors="replace"))
     except Exception:
         pass
     finally:
@@ -101,18 +109,13 @@ def main():
     if not TOKEN:
         print("用法: python3 ghvss_cli.py <EXEC_TOKEN>", file=sys.stderr)
         sys.exit(1)
-    session_id = get_session_id()
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)  # raw 模式（关闭行缓冲/echo）
-        sio.connect(
-            URL,
-            auth={"token": TOKEN, "session_id": session_id},
-            transports=["websocket"],
-            wait_timeout=25,
-        )
-        threading.Thread(target=send_loop, daemon=True).start()
+        tty.setraw(fd)
+        sio.connect(URL, auth={"token": TOKEN, "session": SESSION},
+                    transports=["websocket"], wait_timeout=25)
+        threading.Thread(target=_send_loop, daemon=True).start()
         sio.wait()
     except Exception as e:
         print(f"\r\n[错误] {e}\r\n", file=sys.stderr)
