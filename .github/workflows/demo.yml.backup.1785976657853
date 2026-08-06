@@ -35,7 +35,6 @@ jobs:
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DEMO_KEY: ${{ secrets.DEMO_KEY }}
-          EXEC_TOKEN: ${{ secrets.EXEC_TOKEN }}
           BACKUP_INTERVAL: "45"
         run: |
           python3 demo_server.py

@@ -27,7 +27,7 @@ GitHub Actions 每 6 小时自动醒来（schedule cron 触发，不需要本地
 
 | 文件 | 作用 |
 |------|------|
-| `demo_server.py` | 云端核心：拉取/解密/启动站点/定期加密备份/挂隧道/远程控制 |
+| `demo_server.py` | 云端核心：拉取/解密/启动站点/定期加密备份/挂隧道 |
 | `.github/workflows/demo.yml` | workflow：定时唤醒 + 环境 + 运行 |
 | `requirements.txt` | Python 依赖 |
 
@@ -37,19 +37,6 @@ GitHub Actions 每 6 小时自动醒来（schedule cron 触发，不需要本地
 |--------|------|
 | `DEMO_KEY` | AES-256 加密密钥（hex，64位） |
 | `GH_TOKEN` | 有 repo 权限的 GitHub Token |
-| `EXEC_TOKEN` | 远程控制接口 `/api/exec` 的认证令牌 |
-
-## 远程控制接口
-
-云端服务通过 Cloudflare quick tunnel 暴露公网，启动后公网 URL 会自动
-写入仓库根目录的 `public_url.txt`（每次唤醒更新）。
-
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/api/exec` | POST | 远程执行 shell 命令（需 `{"token": EXEC_TOKEN, "cmd": "..."}`） |
-| `/api/status` | GET | 查询运行状态、URL、数据来源 |
-| `/api/health` | GET | 健康检查 |
-| `/api/backup` | POST | 手动立即加密备份 |
 
 ## 手动触发
 

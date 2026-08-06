@@ -5,20 +5,17 @@ GitHub Actions 临时环境加密持久化演示站点核心脚本
 
 核心思路：利用 GitHub Actions 的 schedule 定时唤醒 + GitHub Releases 永久存储，
 实现无需本地守护进程的"云端自动续命 + 数据加密持久化"。
-
-功能：
-- 启动时从 GitHub Releases 拉取 AES-256-GCM 加密备份并解密恢复
-- 后台线程定期把数据库加密后上传回 Releases（修复 uploads.github.com 域名）
-- Flask 演示站点（留言板，验证跨 job 持久化）
-- Cloudflare quick tunnel 暴露公网，URL 自动上报到仓库 public_url.txt
-- 远程控制接口 /api/exec（带 EXEC_TOKEN 认证），可实时执行 shell 命令
+- 启动时：从 GitHub Releases 拉取 AES-256-GCM 加密备份 -> 解密 -> 打开数据库
+- 运行中：后台线程定期把数据库加密后上传回 Releases
+- 6 小时到点销毁，数据已安全保存在 Releases 中，下个 schedule 自动恢复
 """
 import os
+import sys
 import json
+import io
 import time
 import uuid
 import sqlite3
-import base64
 import threading
 import datetime
 import subprocess
@@ -32,17 +29,11 @@ from flask import Flask, request, jsonify, render_template_string
 REPO = os.environ.get("REPO", "7891333/demo-vps")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 DEMO_KEY = os.environ.get("DEMO_KEY", "")
-EXEC_TOKEN = os.environ.get("EXEC_TOKEN", "")
 BACKUP_TAG = "backup"
 ASSET_NAME = "demo.db.enc"
 DB_FILE = "demo.db"
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = 8080
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))  # 秒
-
-JOB_ID = uuid.uuid4().hex[:8]
-START_TIME = datetime.datetime.now(datetime.timezone.utc)
-LAST_URL = ""
-LOAD_STATUS = "初始化中"
 
 # ==================== 加密工具 ====================
 def encrypt_file(data: bytes, key_hex: str) -> bytes:
@@ -53,7 +44,6 @@ def encrypt_file(data: bytes, key_hex: str) -> bytes:
     ciphertext, tag = cipher.encrypt_and_digest(data)
     return cipher.nonce + tag + ciphertext
 
-
 def decrypt_file(blob: bytes, key_hex: str) -> bytes:
     """AES-256-GCM 解密，校验完整性"""
     from Crypto.Cipher import AES
@@ -62,10 +52,8 @@ def decrypt_file(blob: bytes, key_hex: str) -> bytes:
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
     return cipher.decrypt_and_verify(ciphertext, tag)
 
-
-# ==================== GitHub API ====================
-def gh_request(method, url, data=None, headers=None, raw=False, timeout=60):
-    """通用 GitHub API 请求，返回 (status, body)"""
+# ==================== GitHub Releases API ====================
+def gh_request(method, url, data=None, headers=None, raw=False):
     h = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     if headers:
         h.update(headers)
@@ -74,7 +62,7 @@ def gh_request(method, url, data=None, headers=None, raw=False, timeout=60):
     if data is not None:
         body = data if isinstance(data, bytes) else json.dumps(data).encode()
     try:
-        with urllib.request.urlopen(req, body, timeout=timeout) as r:
+        with urllib.request.urlopen(req, body, timeout=30) as r:
             content = r.read()
             if raw:
                 return r.status, content
@@ -85,79 +73,55 @@ def gh_request(method, url, data=None, headers=None, raw=False, timeout=60):
             return e.code, json.loads(content.decode() or "null")
         except Exception:
             return e.code, content.decode(errors="replace")
-    except Exception as e:
-        return 0, str(e)
-
 
 def get_release():
-    """获取 backup release，不存在返回 None"""
     url = f"https://api.github.com/repos/{REPO}/releases/tags/{BACKUP_TAG}"
     status, data = gh_request("GET", url)
     return data if status == 200 else None
 
-
 def ensure_release():
-    """确保 backup release 存在，返回 release id"""
     rel = get_release()
     if rel:
         return rel["id"]
     url = f"https://api.github.com/repos/{REPO}/releases"
-    data = {
-        "tag_name": BACKUP_TAG,
-        "name": "加密备份",
-        "body": "AES-256-GCM 加密的数据库备份（自动生成）",
-        "draft": False,
-        "prerelease": False,
-    }
+    data = {"tag_name": BACKUP_TAG, "name": "加密备份", "body": "AES-256-GCM 加密的数据库备份", "draft": False, "prerelease": False}
     status, d = gh_request("POST", url, data=data)
-    if status in (200, 201):
-        return d.get("id")
-    raise RuntimeError(f"创建 release 失败: {status} {d}")
+    return d.get("id")
 
+def download_asset_download_url(release_id):
+    url = f"https://api.github.com/repos/{REPO}/releases/{release['id']}" if False else None
+    return None
 
 def load_or_create():
     """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
-    global LOAD_STATUS
     rel = get_release()
     if rel:
         for a in rel.get("assets", []):
             if a.get("name") == ASSET_NAME:
-                status, blob = gh_request(
-                    "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}", raw=True
-                )
+                url = f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}"
+                status, blob = gh_request("GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}", raw=True)
                 if status == 200:
                     try:
                         data = decrypt_file(blob, DEMO_KEY)
                         with open(DB_FILE, "wb") as f:
                             f.write(data)
-                        LOAD_STATUS = f"从 Releases 恢复加密备份（{len(data)} 字节）"
-                        print(f"[load] {LOAD_STATUS}", flush=True)
-                        return
+                        return f"已从 Releases 恢复加密备份（{len(data)} 字节，解密成功）"
                     except Exception as e:
-                        print(f"[load] 解密失败，改用新库: {e}", flush=True)
-    create_new_db()
-    LOAD_STATUS = "新建初始数据库"
-    print(f"[load] {LOAD_STATUS}", flush=True)
-
+                        return f"备份解密失败，改用新库: {e}"
+    return create_new_db()
 
 def create_new_db():
-    """创建初始数据库结构"""
     conn = sqlite3.connect(DB_FILE)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT)"
-    )
+    conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
     conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('visits', '0')")
-    conn.execute(
-        "INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?)",
-        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
-    )
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?)", (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
     conn.commit()
     conn.close()
-
+    return "新建了初始数据库"
 
 def backup_database():
-    """把当前数据库加密后上传到 Releases（覆盖旧备份），返回 (大小, HTTP状态)"""
+    """把当前数据库加密后上传到 Releases（覆盖旧备份）"""
     with open(DB_FILE, "rb") as f:
         data = f.read()
     enc = encrypt_file(data, DEMO_KEY)
@@ -167,61 +131,19 @@ def backup_database():
         for a in rel.get("assets", []):
             if a.get("name") == ASSET_NAME:
                 gh_request("DELETE", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}")
-    # 关键：上传 asset 必须用 uploads.github.com 域名，用 api.github.com 会 404
-    url = f"https://uploads.github.com/repos/{REPO}/releases/{rel_id}/assets?name={ASSET_NAME}"
-    status, resp = gh_request("POST", url, data=enc, headers={"Content-Type": "application/octet-stream"})
+    url = f"https://api.github.com/repos/{REPO}/releases/{rel_id}/assets?name={ASSET_NAME}"
+    status, _ = gh_request("POST", url, data=enc, headers={"Content-Type": "application/octet-stream"})
     return len(enc), status
-
-
-def report_url(url):
-    """把公网 URL 写到仓库的 public_url.txt，方便随时查询"""
-    global LAST_URL
-    LAST_URL = url
-    try:
-        get_url = f"https://api.github.com/repos/{REPO}/contents/public_url.txt"
-        status, data = gh_request("GET", get_url)
-        payload = {
-            "message": f"update public url {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "content": base64.b64encode(url.encode()).decode(),
-        }
-        if status == 200:
-            payload["sha"] = data.get("sha")
-        gh_request("PUT", get_url, data=payload)
-        print(f"[url] 已上报公网地址: {url}", flush=True)
-    except Exception as e:
-        print(f"[url] 上报失败: {e}", flush=True)
-
-
-def start_tunnel():
-    """启动 cloudflared quick tunnel，暴露公网地址并上报"""
-    try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        reported = False
-        for line in proc.stdout:
-            line = line.strip()
-            if "trycloudflare.com" in line:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-                if m and not reported:
-                    url = m.group(0)
-                    print(f"[tunnel] 公网地址: {url}", flush=True)
-                    report_url(url)
-                    reported = True
-    except Exception as e:
-        print(f"[tunnel] 启动失败: {e}", flush=True)
-
 
 # ==================== Flask 站点 ====================
 app = Flask(__name__)
-
+JOB_ID = uuid.uuid4().hex[:8]
+START_TIME = datetime.datetime.now(datetime.timezone.utc)
 
 def get_conn():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def bump_visits():
     conn = get_conn()
@@ -232,17 +154,8 @@ def bump_visits():
     conn.close()
     return int(row["value"])
 
-
 def elapsed_seconds():
     return int((datetime.datetime.now(datetime.timezone.utc) - START_TIME).total_seconds())
-
-
-def elapsed_str(sec):
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -259,6 +172,7 @@ header h1{font-size:22px;font-weight:600;letter-spacing:0.5px;color:#fff}
 header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 .badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:11px;font-weight:500;letter-spacing:0.3px;border:1px solid #333}
 .badge.green{color:#7ee787;border-color:#2a5e2a}
+.badge.gray{color:#aaa;border-color:#333}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
 .card{background:#1e1e1e;border:1px solid #2a2a2a;border-radius:6px;padding:18px}
 .card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
@@ -305,7 +219,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
   </div>
   <div class="card">
     <div class="label">运行时长</div>
-    <div class="val" id="elapsed">{{ elapsed }}</div>
+    <div class="val" id="elapsed">{{ elapsed }}s</div>
     <div class="sub">本次 job 已运行</div>
   </div>
   <div class="card">
@@ -374,18 +288,14 @@ setInterval(function(){
 </body>
 </html>"""
 
-
 @app.route("/")
 def index():
     v = bump_visits()
     conn = get_conn()
     msgs = [dict(r) for r in conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 50")]
     conn.close()
-    return render_template_string(
-        HTML, job_id=JOB_ID, elapsed=elapsed_str(elapsed_seconds()), visits=v,
-        source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL,
-    )
-
+    return render_template_string(HTML, job_id=JOB_ID, elapsed=elapsed_seconds(), visits=v,
+                                  source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL)
 
 @app.route("/api/add", methods=["POST"])
 def add_msg():
@@ -396,14 +306,11 @@ def add_msg():
     if len(content) > 200:
         return jsonify(ok=False, error="内容过长"), 400
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO messages (content, created_at) VALUES (?, ?)",
-        (content, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-    )
+    conn.execute("INSERT INTO messages (content, created_at) VALUES (?, ?)",
+                 (content, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
-
 
 @app.route("/api/backup", methods=["POST"])
 def manual_backup():
@@ -413,43 +320,9 @@ def manual_backup():
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
-
 @app.route("/api/health")
 def health():
     return jsonify(ok=True, job_id=JOB_ID, elapsed=elapsed_seconds())
-
-
-@app.route("/api/status")
-def api_status():
-    return jsonify(
-        ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(),
-        url=LAST_URL, source=LOAD_STATUS, backup_interval=BACKUP_INTERVAL,
-    )
-
-
-@app.route("/api/exec", methods=["POST"])
-def exec_cmd():
-    """远程控制：带令牌认证，执行 shell 命令并返回输出"""
-    data = request.get_json(silent=True) or {}
-    token = data.get("token", "")
-    if not EXEC_TOKEN or token != EXEC_TOKEN:
-        return jsonify(ok=False, error="未授权"), 403
-    cmd = (data.get("cmd") or "").strip()
-    if not cmd:
-        return jsonify(ok=False, error="命令为空"), 400
-    if len(cmd) > 2000:
-        return jsonify(ok=False, error="命令过长"), 400
-    try:
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-        return jsonify(
-            ok=True, code=proc.returncode,
-            stdout=proc.stdout[-4000:], stderr=proc.stderr[-2000:],
-        )
-    except subprocess.TimeoutExpired:
-        return jsonify(ok=False, error="命令执行超时(30s)"), 500
-    except Exception as e:
-        return jsonify(ok=False, error=str(e)), 500
-
 
 # ==================== 后台备份线程 ====================
 def backup_loop():
@@ -461,18 +334,31 @@ def backup_loop():
         except Exception as e:
             print(f"[backup] 失败: {e}", flush=True)
 
+# ==================== Cloudflare 隧道 ====================
+def start_tunnel():
+    """启动 cloudflared quick tunnel，暴露公网地址"""
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        # 解析公网 URL
+        for line in proc.stdout:
+            line = line.strip()
+            if "trycloudflare.com" in line:
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    print(f"[tunnel] 公网地址: {m.group(0)}", flush=True)
+                    break
+    except Exception as e:
+        print(f"[tunnel] 启动失败: {e}", flush=True)
 
 # ==================== main ====================
 if __name__ == "__main__":
     print(f"=== Job ID: {JOB_ID} ===", flush=True)
     print(f"=== 仓库: {REPO} ===", flush=True)
-    if not DEMO_KEY:
-        print("[warn] DEMO_KEY 未设置，加密不可用", flush=True)
-    if not GH_TOKEN:
-        print("[warn] GH_TOKEN 未设置，备份不可用", flush=True)
-    if not EXEC_TOKEN:
-        print("[warn] EXEC_TOKEN 未设置，远程控制不可用", flush=True)
-    load_or_create()
+    LOAD_STATUS = load_or_create()
+    print(f"=== 数据加载: {LOAD_STATUS} ===", flush=True)
     threading.Thread(target=backup_loop, daemon=True).start()
     threading.Thread(target=start_tunnel, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
