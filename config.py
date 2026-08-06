@@ -44,7 +44,7 @@ FILES_DIR = os.path.expanduser(os.environ.get("FILES_DIR", "~/files"))
 
 # ==================== 服务 ====================
 PORT = int(os.environ.get("PORT", "8080"))
-BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "120"))
 
 # ==================== 无缝衔接 ====================
 PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))

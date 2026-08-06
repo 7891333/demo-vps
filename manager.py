@@ -25,6 +25,7 @@ logger = log.setup_logger("manager")
 
 leader = None
 _fail_counts = {}  # inst_id -> 连续失败次数
+_worker_heartbeats = {}  # inst_id -> {job_id, last_seen}（内部心跳，不占GitHub配额）
 
 
 def _elapsed():
@@ -100,6 +101,32 @@ def api_logs():
 
 
 # ==================== 账号管理（任务化） ====================
+
+
+@app.route("/api/worker/heartbeat", methods=["POST"])
+def api_worker_heartbeat():
+    """worker 内部心跳（不占 GitHub 配额）"""
+    if not _check_token():
+        return jsonify(ok=False, error="未授权"), 401
+    data = request.get_json(silent=True) or {}
+    inst_id = data.get("inst_id", "")
+    job_id = data.get("job_id", "")
+    if inst_id:
+        _worker_heartbeats[inst_id] = {"job_id": job_id, "last_seen": time.time()}
+    return jsonify(ok=True)
+
+
+@app.route("/api/worker/leader")
+def api_worker_leader():
+    """查询实例的 leader（判断该 worker 是否最新）"""
+    if not _check_token():
+        return jsonify(ok=False, error="未授权"), 401
+    inst_id = request.args.get("inst_id", "")
+    job_id = request.args.get("job_id", "")
+    hb = _worker_heartbeats.get(inst_id)
+    is_leader = bool(hb and hb.get("job_id") == job_id)
+    return jsonify(ok=True, is_leader=is_leader, current=hb)
+
 @app.route("/api/accounts", methods=["GET"])
 @require_auth
 def api_list_accounts():
@@ -347,7 +374,7 @@ def _auto_update_loop():
     if not current_sha:
         return
     while True:
-        time.sleep(300)
+        time.sleep(600)
         try:
             url = f"https://api.github.com/repos/{config.MAIN_REPO}/commits/main"
             status, d = core.gh_request("GET", url)
@@ -355,7 +382,11 @@ def _auto_update_loop():
             if latest and latest != current_sha:
                 logger.info(f"[update] 检测到新版本 {latest[:10]}，滚动重启")
                 url2 = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{config.MANAGER_WORKFLOW}/dispatches"
-                core.gh_request("POST", url2, data={"ref": "main"})
+                status2, _ = core.gh_request("POST", url2, data={"ref": "main"})
+                if status2 not in (200, 204):
+                    # 触发失败：继续运行，不退出（防止全挂）
+                    logger.error(f"[update] 触发新 manager 失败({status2})，继续运行")
+                    continue
                 time.sleep(60)
                 os._exit(0)
         except Exception as e:

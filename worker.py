@@ -483,6 +483,70 @@ def _save_prev_backup():
         print(f"[backup] 保存快照失败: {e}", flush=True)
 
 
+
+
+
+class ManagerLock:
+    """基于 manager 内存的内部锁（不占 GitHub 配额）"""
+    def __init__(self):
+        self.is_leader = False
+        self.mgr_host = os.environ.get("MANAGER_HOST", "ghvps.kekeke.cc.cd")
+        self.job_id = core.JOB_ID
+
+    def _mgr_post(self, path, data):
+        try:
+            url = f"https://{self.mgr_host}{path}"
+            payload = json.dumps(data).encode()
+            req = urllib.request.Request(url, data=payload,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {config.EXEC_TOKEN}"})
+            urllib.request.urlopen(req, timeout=10)
+            return True
+        except Exception:
+            return False
+
+    def _mgr_get(self, path):
+        try:
+            url = f"https://{self.mgr_host}{path}"
+            req = urllib.request.Request(url,
+                headers={"Authorization": f"Bearer {config.EXEC_TOKEN}"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read().decode())
+        except Exception:
+            return None
+
+    def acquire(self):
+        self._mgr_post("/api/worker/heartbeat",
+                       {"inst_id": config.INSTANCE_ID, "job_id": self.job_id})
+        d = self._mgr_get(f"/api/worker/leader?inst_id={config.INSTANCE_ID}&job_id={self.job_id}")
+        self.is_leader = bool(d and d.get("is_leader"))
+        if self.is_leader:
+            print(f"[lock] 本 worker 是 leader: {self.job_id}", flush=True)
+        else:
+            print(f"[lock] 本 worker 是 follower（manager 判断）", flush=True)
+        return self.is_leader
+
+    def heartbeat_loop(self):
+        while True:
+            if not self.is_leader:
+                return
+            time.sleep(30)
+            self._mgr_post("/api/worker/heartbeat",
+                           {"inst_id": config.INSTANCE_ID, "job_id": self.job_id})
+
+    def follower_loop(self, on_promote):
+        while True:
+            if self.is_leader:
+                return
+            time.sleep(30)
+            d = self._mgr_get(f"/api/worker/leader?inst_id={config.INSTANCE_ID}&job_id={self.job_id}")
+            if d and d.get("is_leader"):
+                self.is_leader = True
+                print(f"[lock] follower 升级为 leader: {self.job_id}", flush=True)
+                on_promote()
+                return
+
+
 def _worker_pre_wake():
     done = False
     while True:
@@ -494,6 +558,13 @@ def _worker_pre_wake():
                 print(f"[prewake] 实例 {config.INSTANCE_ID} 已关闭，不再续命", flush=True)
                 return
             try:
+                # 续命前强制备份（保证交接数据最新，不丢数据）
+                try:
+                    core.backup_database()
+                    core.backup_files()
+                    print("[prewake] 续命前强制备份完成", flush=True)
+                except Exception as be:
+                    print(f"[prewake] 强制备份失败: {be}", flush=True)
                 url = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{config.WORKER_WORKFLOW}/dispatches"
                 core.gh_request("POST", url, data={"ref": "main", "inputs": {"INSTANCE_ID": config.INSTANCE_ID}})
                 print(f"[prewake] 已预触发下一个 worker（{config.INSTANCE_ID}）", flush=True)
@@ -525,7 +596,12 @@ def _auto_update_loop():
                 except Exception as e:
                     print(f"[update] fork同步失败: {e}", flush=True)
                 url3 = f"https://api.github.com/repos/{config.REPO}/actions/workflows/{config.WORKER_WORKFLOW}/dispatches"
-                core.gh_request("POST", url3, data={"ref": "main", "inputs": {"INSTANCE_ID": config.INSTANCE_ID}})
+                status2, _ = core.gh_request("POST", url3, data={"ref": "main", "inputs": {"INSTANCE_ID": config.INSTANCE_ID}})
+                if status2 not in (200, 204):
+                    # 触发失败：继续运行，不退出（防止全挂）
+                    print(f"[update] 触发新 worker 失败({status2})，继续运行", flush=True)
+                    time.sleep(300)
+                    continue
                 print("[update] 已触发新 worker，60秒后旧实例退出", flush=True)
                 time.sleep(60)
                 os._exit(0)
@@ -566,7 +642,7 @@ def run():
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)
     from core import LeaderLock
-    leader = LeaderLock()
+    leader = ManagerLock()
     leader.acquire()
     if leader.is_leader:
         threading.Thread(target=_backup_loop, daemon=True).start()

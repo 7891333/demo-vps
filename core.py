@@ -75,9 +75,17 @@ def get_release(token=None):
     return data if status == 200 else None
 
 
+_release_cache = {}
+
+
 def ensure_release(token=None):
+    # 缓存 release id，减少 API 调用（省配额）
+    cache_key = token or config.GH_TOKEN
+    if cache_key in _release_cache:
+        return _release_cache[cache_key]
     rel = get_release(token=token)
     if rel:
+        _release_cache[cache_key] = rel["id"]
         return rel["id"]
     url = f"https://api.github.com/repos/{config.REPO}/releases"
     data = {
@@ -86,6 +94,7 @@ def ensure_release(token=None):
     }
     status, d = gh_request("POST", url, token=token, data=data)
     if status in (200, 201):
+        _release_cache[cache_key] = d.get("id")
         return d.get("id")
     raise RuntimeError(f"创建 release 失败: {status} {d}")
 
