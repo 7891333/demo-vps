@@ -91,7 +91,7 @@ func udpSendmmsg(target string, port int, concurrency int, packetSize int, durat
 	copy(sockaddr.Addr[:], dst4)
 
 	// 预分配批量包
-	const batch = 128
+	const batch = 512
 	packets := make([][]byte, batch)
 	for i := 0; i < batch; i++ {
 		packets[i] = make([]byte, packetSize)
