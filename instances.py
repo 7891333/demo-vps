@@ -41,7 +41,6 @@ def _save_instance_config(account, inst_id, payload):
     repo = account["repo"]
     token = account["token"]
     asset_name = f"inst-{inst_id}.json.enc"
-    # 确保 release 存在
     url = _account_repo_url(repo, f"/releases/tags/{config.BACKUP_TAG}")
     status, d = core.gh_request("GET", url, token=token)
     if status != 200:
@@ -49,11 +48,9 @@ def _save_instance_config(account, inst_id, payload):
                         data={"tag_name": config.BACKUP_TAG, "name": "实例配置", "body": ""})
         status, d = core.gh_request("GET", url, token=token)
     rel_id = d["id"]
-    # 删除旧 asset
     for a in d.get("assets", []):
         if a.get("name") == asset_name:
             core.gh_request("DELETE", _account_repo_url(repo, f"/releases/assets/{a['id']}"), token=token)
-    # 上传加密配置
     enc = core.encrypt(json.dumps(payload).encode())
     up_url = f"https://uploads.github.com/repos/{repo}/releases/{rel_id}/assets?name={asset_name}"
     core.gh_request("POST", up_url, token=token, data=enc,
@@ -68,7 +65,6 @@ def _trigger_worker(account, inst_id):
                                 data={"ref": "main", "inputs": {"INSTANCE_ID": inst_id}})
     if status not in (200, 204):
         raise RuntimeError(f"触发 worker 失败: {status} {d}")
-    # 找到 run_id
     time.sleep(4)
     runs_url = _account_repo_url(repo, "/actions/runs?per_page=1")
     status, d = core.gh_request("GET", runs_url, token=account["token"])
@@ -90,7 +86,7 @@ def _cancel_worker(account, run_id):
 def create_instance(manager_token=None):
     """
     创建新工作实例（全自动）：
-    选账号 → 建隧道 → 存配置 → 触发 worker → 记录清单
+    选账号 → 同步fork最新代码 → 建隧道 → 存配置 → 触发 worker → 记录清单
     """
     # 1. 负载均衡选账号
     sel = accounts.select_best_account(token=manager_token, workflow=config.WORKER_WORKFLOW)
@@ -100,16 +96,22 @@ def create_instance(manager_token=None):
 
     instances = load_instances(token=manager_token)
     inst_id = _next_inst_id(instances)
-    # 用一级子域名（如 inst1.kekeke.cc.cd），确保被 *.kekeke.cc.cd 通配符证书覆盖
     hostname = f"{inst_id}.{config.BASE_DOMAIN}"
 
-    # 2. 创建 CF 隧道（全自动）
+    # 2. 同步账号 fork 仓库到最新（保证新实例用最新代码）
+    try:
+        accounts.sync_fork(account)
+        time.sleep(2)
+    except Exception as e:
+        print(f"[create] fork 同步异常（继续）: {e}", flush=True)
+
+    # 3. 创建 CF 隧道
     try:
         tunnel_id, tunnel_token = tunnels.create_tunnel(hostname)
     except Exception as e:
         return {"ok": False, "error": f"创建隧道失败: {e}"}
 
-    # 3. 存实例配置到账号仓库（worker 启动时读取）
+    # 4. 存实例配置到账号仓库
     try:
         _save_instance_config(account, inst_id, {
             "inst_id": inst_id,
@@ -122,14 +124,14 @@ def create_instance(manager_token=None):
         tunnels.delete_tunnel(tunnel_id, hostname)
         return {"ok": False, "error": f"保存实例配置失败: {e}"}
 
-    # 4. 触发 worker
+    # 5. 触发 worker
     try:
         run_id = _trigger_worker(account, inst_id)
     except Exception as e:
         tunnels.delete_tunnel(tunnel_id, hostname)
         return {"ok": False, "error": f"触发 worker 失败: {e}"}
 
-    # 5. 记录实例清单
+    # 6. 记录实例清单
     inst = {
         "id": inst_id,
         "hostname": hostname,
@@ -155,12 +157,10 @@ def close_instance(inst_id, manager_token=None):
     if not inst:
         return {"ok": False, "error": f"实例 {inst_id} 不存在"}
 
-    # 找账号
     account = next((a for a in accounts.load_accounts(token=manager_token)
                     if a["name"] == inst.get("account")), None)
     if account:
         _cancel_worker(account, inst.get("run_id"))
-        # 删除账号仓库的实例配置
         try:
             asset_name = f"inst-{inst_id}.json.enc"
             url = _account_repo_url(account["repo"], f"/releases/tags/{config.BACKUP_TAG}")
@@ -172,13 +172,11 @@ def close_instance(inst_id, manager_token=None):
         except Exception:
             pass
 
-    # 删除隧道 DNS
     try:
         tunnels.delete_tunnel(inst.get("tunnel_id"), inst.get("hostname"))
     except Exception:
         pass
 
-    # 标记关闭
     inst["closed"] = True
     inst["status"] = "closed"
     save_instances(instances, token=manager_token)
@@ -195,7 +193,6 @@ def get_instance(inst_id, manager_token=None):
     return next((i for i in instances if i["id"] == inst_id), None)
 
 
-# ==================== 实例心跳/状态更新（worker 调用） ====================
 def worker_report(inst_id, url, manager_token=None):
     """worker 启动后上报 URL 和状态"""
     instances = load_instances(token=manager_token)

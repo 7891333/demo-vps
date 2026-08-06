@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""多账号管理：配置存储 + 负载均衡 + 全自动创建（fork+配secrets）"""
+"""多账号管理：配置存储 + 负载均衡 + 全自动创建（fork+配secrets）+ fork自动同步"""
 import json
 import time
 import base64
@@ -68,6 +68,30 @@ def list_accounts(token=None):
     return result
 
 
+# ==================== fork 自动同步 ====================
+def sync_fork(account):
+    """
+    把账号 fork 仓库同步到上游最新（merge-upstream）。
+    返回 True/False
+    """
+    try:
+        repo = account.get("repo") or config.REPO
+        token = account.get("token")
+        if repo == config.REPO:
+            return True  # 主仓库无需同步
+        url = f"https://api.github.com/repos/{repo}/merge-upstream"
+        status, d = core.gh_request("POST", url, token=token, data={"branch": "main"})
+        ok = status in (200, 201)
+        if ok:
+            print(f"[sync] 已同步 {repo} 到上游最新", flush=True)
+        else:
+            print(f"[sync] {repo} 同步状态: {status} {d.get('message','')}", flush=True)
+        return ok
+    except Exception as e:
+        print(f"[sync] 同步失败: {e}", flush=True)
+        return False
+
+
 # ==================== GitHub Secrets 配置（libsodium sealed box） ====================
 def _set_repo_secret(account_token, repo, secret_name, secret_value):
     """用 GitHub API 配置仓库 secret（libsodium sealed box 加密）"""
@@ -97,13 +121,11 @@ def _ensure_repo(account_token, repo_name):
     status, _ = core.gh_request("GET", f"https://api.github.com/repos/{full}", token=account_token)
     if status == 200:
         return full, True
-    # fork 主仓库
     print(f"[repo] 账号无仓库，fork 主仓库...", flush=True)
     status, d = core.gh_request("POST", f"https://api.github.com/repos/{config.REPO}/forks",
                                 token=account_token, data={"default_branch_only": True})
     if status not in (200, 202):
         return None, False
-    # 等待 fork 完成
     for _ in range(60):
         time.sleep(5)
         status, _ = core.gh_request("GET", f"https://api.github.com/repos/{full}", token=account_token)
@@ -116,29 +138,30 @@ def _ensure_repo(account_token, repo_name):
 def auto_provision_account(name, account_token, repo=None, max_conc=None, manager_token=None):
     """
     全自动创建账号：
-    ① 验证 token → ② 确保仓库（自动 fork）→ ③ 配置 secrets → ④ 报备
+    ① 验证 token → ② 确保仓库（自动 fork）→ ③ 同步最新代码 → ④ 配置 secrets → ⑤ 报备
     """
-    # 1. 验证 token
     status, user = core.gh_request("GET", "https://api.github.com/user", token=account_token)
     if status != 200:
         return {"ok": False, "error": f"token 无效（{status}）"}
     login = user.get("login", "")
 
-    # 2. 确保仓库
     if not repo:
         repo = f"{login}/{config.REPO.split('/')[-1]}"
     repo, ok = _ensure_repo(account_token, repo)
     if not ok:
         return {"ok": False, "error": "仓库准备失败（fork 超时或失败）"}
 
-    # 3. 配置 secrets
+    # 同步最新代码（fork 仓库）
+    acc = {"repo": repo, "token": account_token}
+    sync_fork(acc)
+    time.sleep(3)  # 等同步完成
+
     ok1 = _set_repo_secret(account_token, repo, "GH_TOKEN", account_token)
     ok2 = _set_repo_secret(account_token, repo, "DEMO_KEY", config.DEMO_KEY)
     ok3 = _set_repo_secret(account_token, repo, "EXEC_TOKEN", config.EXEC_TOKEN)
     if not (ok1 and ok2 and ok3):
         return {"ok": False, "error": "secrets 配置失败"}
 
-    # 4. 报备
     return add_account(name, account_token, repo=repo, max_conc=max_conc, token=manager_token)
 
 
