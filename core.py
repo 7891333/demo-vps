@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享核心：加密、GitHub API（多账号）、Releases 存储、leader锁、续命"""
+"""共享核心：加密、GitHub API（多账号）、Releases 存储（并发分片）、leader锁、续命"""
 import io
 import os
 import json
@@ -12,6 +12,7 @@ import datetime
 import subprocess
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 from Crypto.Cipher import AES
 
@@ -20,6 +21,11 @@ import config
 # 全局 job 标识
 JOB_ID = uuid.uuid4().hex[:8]
 START_TIME = datetime.datetime.now(datetime.timezone.utc)
+
+# 分片大小（单 asset 上限 2GB，用 500MB 安全）
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(500 * 1024 * 1024)))
+# 并发上传/下载线程数（避免触发 GitHub 频率限制）
+CHUNK_CONCURRENCY = int(os.environ.get("CHUNK_CONCURRENCY", "5"))
 
 
 # ==================== 加密 ====================
@@ -38,8 +44,7 @@ def decrypt(blob: bytes) -> bytes:
 
 
 # ==================== GitHub API（支持多账号） ====================
-def gh_request(method, url, token=None, data=None, headers=None, raw=False, timeout=60):
-    """通用 GitHub API 请求。token 为空则用 config.GH_TOKEN"""
+def gh_request(method, url, token=None, data=None, headers=None, raw=False, timeout=180):
     tok = token or config.GH_TOKEN
     h = {"Authorization": f"token {tok}", "Accept": "application/vnd.github.v3+json"}
     if headers:
@@ -94,17 +99,17 @@ def _delete_asset(name, token=None):
 
 
 def upload_asset(name, data_bytes, token=None):
-    """上传 asset。必须用 uploads.github.com"""
+    """上传单个 asset（必须用 uploads.github.com）"""
     rel_id = ensure_release(token=token)
     _delete_asset(name, token=token)
     url = f"https://uploads.github.com/repos/{config.REPO}/releases/{rel_id}/assets?name={name}"
     status, _ = gh_request("POST", url, token=token, data=data_bytes,
-                           headers={"Content-Type": "application/octet-stream"})
+                           headers={"Content-Type": "application/octet-stream"}, timeout=180)
     return len(data_bytes), status
 
 
 def download_asset(name, token=None):
-    """下载 asset，必须带 Accept: application/octet-stream"""
+    """下载单个 asset，必须带 Accept: application/octet-stream"""
     rel = get_release(token=token)
     if not rel:
         return None
@@ -112,19 +117,77 @@ def download_asset(name, token=None):
         if a.get("name") == name:
             status, blob = gh_request(
                 "GET", f"https://api.github.com/repos/{config.REPO}/releases/assets/{a['id']}",
-                token=token, raw=True, headers={"Accept": "application/octet-stream"})
+                token=token, raw=True, headers={"Accept": "application/octet-stream"}, timeout=180)
             return blob if status == 200 else None
+    return None
+
+
+# ==================== 并发分片上传/下载 ====================
+def upload_asset_chunked(name, data_bytes, token=None, concurrency=None):
+    """
+    分片加密上传大文件（并发）。
+    小文件：直接上传单 asset。
+    大文件：切块加密并发上传为 name.part0/1/...，再上传 manifest。
+    返回 (总大小, 分片数)
+    """
+    conc = concurrency or CHUNK_CONCURRENCY
+    if len(data_bytes) <= CHUNK_SIZE:
+        size, status = upload_asset(name, encrypt(data_bytes), token=token)
+        return size, 1
+    parts = (len(data_bytes) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    chunks = [(i, data_bytes[i * CHUNK_SIZE:(i + 1) * CHUNK_SIZE]) for i in range(parts)]
+
+    def _upload(args):
+        i, chunk = args
+        upload_asset(f"{name}.part{i}", encrypt(chunk), token=token)
+        return i, len(chunk)
+
+    with ThreadPoolExecutor(max_workers=conc) as ex:
+        for i, size in ex.map(_upload, chunks):
+            print(f"[chunk] {name}.part{i} 上传 {size} 字节", flush=True)
+    upload_asset(f"{name}.manifest", encrypt(json.dumps({"parts": parts}).encode()), token=token)
+    return len(data_bytes), parts
+
+
+def download_asset_chunked(name, token=None, concurrency=None):
+    """并发下载并合并分片文件，返回解密后的原始明文"""
+    conc = concurrency or CHUNK_CONCURRENCY
+    manifest_blob = download_asset(f"{name}.manifest", token=token)
+    if manifest_blob:
+        try:
+            manifest = json.loads(decrypt(manifest_blob).decode())
+            parts = int(manifest["parts"])
+            results = [None] * parts
+
+            def _download(i):
+                blob = download_asset(f"{name}.part{i}", token=token)
+                return i, decrypt(blob) if blob else None
+
+            with ThreadPoolExecutor(max_workers=conc) as ex:
+                for i, data in ex.map(_download, range(parts)):
+                    results[i] = data
+            if any(d is None for d in results):
+                raise RuntimeError("部分分片缺失")
+            return b"".join(results)
+        except Exception as e:
+            print(f"[chunk] 分片合并失败: {e}", flush=True)
+            return None
+    # 无 manifest，单文件
+    blob = download_asset(name, token=token)
+    if blob:
+        try:
+            return decrypt(blob)
+        except Exception:
+            return None
     return None
 
 
 # ==================== 加密 JSON 存取 ====================
 def save_json_enc(asset_name, obj, token=None):
-    """把对象加密后存为 asset"""
     return upload_asset(asset_name, encrypt(json.dumps(obj).encode()), token=token)
 
 
 def load_json_enc(asset_name, token=None, default=None):
-    """读取并解密 asset 为对象"""
     blob = download_asset(asset_name, token=token)
     if not blob:
         return default
@@ -156,13 +219,12 @@ def create_new_db():
 def load_or_create(token=None):
     """恢复数据库+文件，返回状态描述"""
     status = "新建初始数据库"
-    blob = download_asset(config.ASSET_DB, token=token)
+    blob = download_asset_chunked(config.ASSET_DB, token=token)
     if blob:
         try:
-            data = decrypt(blob)
             with open(config.DB_FILE, "wb") as f:
-                f.write(data)
-            status = f"从 Releases 恢复加密备份（{len(data)} 字节）"
+                f.write(blob)
+            status = f"从 Releases 恢复加密备份（{len(blob)} 字节）"
         except Exception:
             create_new_db()
     else:
@@ -174,7 +236,7 @@ def load_or_create(token=None):
 def backup_database(token=None):
     with open(config.DB_FILE, "rb") as f:
         data = f.read()
-    return upload_asset(config.ASSET_DB, encrypt(data), token=token)
+    return upload_asset_chunked(config.ASSET_DB, data, token=token)
 
 
 def backup_files(token=None):
@@ -183,15 +245,15 @@ def backup_files(token=None):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         tar.add(config.FILES_DIR, arcname="files")
-    return upload_asset(config.ASSET_FILES, encrypt(buf.getvalue()), token=token)
+    data = buf.getvalue()
+    return upload_asset_chunked(config.ASSET_FILES, data, token=token)
 
 
 def restore_files(token=None):
-    blob = download_asset(config.ASSET_FILES, token=token)
-    if not blob:
+    data = download_asset_chunked(config.ASSET_FILES, token=token)
+    if not data:
         return
     try:
-        data = decrypt(blob)
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             tar.extractall(path=os.path.expanduser("~"))
         os.makedirs(config.FILES_DIR, exist_ok=True)
@@ -254,9 +316,8 @@ class LeaderLock:
                 pass
 
 
-# ==================== 续命（预触发下一个 job） ====================
+# ==================== 续命 ====================
 def pre_wake_loop(token=None, workflow=None):
-    """到期前预触发下一个 job，实现无缝衔接"""
     wf = workflow or config.WORKER_WORKFLOW
     done = False
     while True:
@@ -271,16 +332,3 @@ def pre_wake_loop(token=None, workflow=None):
                 print(f"[prewake] 触发失败: {e}", flush=True)
             break
         time.sleep(60)
-
-
-# ==================== 查询账号并发 ====================
-def count_running_runs(token, workflow=None):
-    """查询指定账号当前运行的 job 数（并发检测）"""
-    url = f"https://api.github.com/repos/{config.REPO}/actions/runs?status=in_progress&per_page=100"
-    status, data = gh_request("GET", url, token=token)
-    if status != 200:
-        return None
-    runs = data.get("workflow_runs", [])
-    if workflow:
-        return sum(1 for r in runs if r.get("path") == workflow)
-    return len(runs)

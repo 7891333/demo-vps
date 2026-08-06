@@ -30,6 +30,50 @@ def init_instance():
     return cfg
 
 
+def _write_shell_profile():
+    """生成 .bashrc：PS1 显示 kodebite + 默认进入持久化目录 + 免密 sudo 提示"""
+    home = os.path.expanduser("~")
+    persist = config.FILES_DIR
+    os.makedirs(persist, exist_ok=True)
+    bashrc = f"""# GitHub Actions 云端终端配置
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export TERM=xterm-256color
+# 主机名显示 kodebite
+export PS1='\\[\\e[32m\\]kodebite@kodebite\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '
+# 默认进入持久化目录
+cd {persist} 2>/dev/null || true
+# 提示 sudo 免密
+alias sudo='sudo '
+"""
+    try:
+        with open(os.path.join(home, ".bashrc"), "w") as f:
+            f.write(bashrc)
+        with open(os.path.join(home, ".bash_profile"), "w") as f:
+            f.write("source ~/.bashrc 2>/dev/null\n")
+        # 设置主机名
+        subprocess.run("sudo hostname kodebite 2>/dev/null || hostname kodebite 2>/dev/null",
+                       shell=True, timeout=5)
+    except Exception as e:
+        print(f"[shell] 配置写入失败: {e}", flush=True)
+
+
+def _run_setup():
+    """启动时执行 ~/files/setup.sh（自启动配置：内核参数、软件、用户等）"""
+    setup = os.path.join(config.FILES_DIR, "setup.sh")
+    if not os.path.exists(setup):
+        return
+    print("[setup] 检测到 setup.sh，后台执行...", flush=True)
+    try:
+        subprocess.Popen(["bash", setup],
+                         stdout=open("/tmp/setup.log", "w"),
+                         stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        print("[setup] setup.sh 已在后台执行，日志 /tmp/setup.log", flush=True)
+    except Exception as e:
+        print(f"[setup] 执行失败: {e}", flush=True)
+
+
 # ==================== Flask / SocketIO ====================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.urandom(24).hex()
@@ -95,23 +139,24 @@ def api_backup():
     if leader and not leader.is_leader:
         return jsonify(ok=False, error="当前为备份节点，不执行备份"), 503
     try:
-        db_size, db_status = core.backup_database()
+        db_size, db_parts = core.backup_database()
         res = core.backup_files()
-        f_size, f_status = res if res else (None, None)
-        return jsonify(ok=True, db_size=db_size, db_status=db_status, files_size=f_size, files_status=f_status)
+        f_size, f_parts = res if res else (None, None)
+        return jsonify(ok=True, db_size=db_size, db_parts=db_parts,
+                       files_size=f_size, files_parts=f_parts)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
 
 @app.route("/api/term/screen")
 def api_term_screen():
-    """返回指定终端会话的干净屏幕文本（pyte）"""
     session_key = request.args.get("session", "")
     return jsonify(ok=True, screen=terminal.get_screen(session_key))
 
 
-# ==================== WSS 终端（bytes 传输） ====================
+# ==================== WSS 终端（bytes 传输 + 断线无缝） ====================
 def _pty_reader(session_key, sid):
+    """读取 PTY 输出并推送。断开时不关 fd（保留 bash 和前台进程）"""
     sess = terminal.SESSIONS.get(session_key)
     if not sess:
         return
@@ -124,14 +169,16 @@ def _pty_reader(session_key, sid):
                     break
                 if data:
                     sess.feed(data)
-                    socketio.emit("output", data, to=sid)  # 原始 bytes
+                    socketio.emit("output", data, to=sid)
             else:
+                # 检查 bash 是否退出（仅当真的退出才通知）
                 wpid, status = os.waitpid(sess.pid, os.WNOHANG)
                 if wpid == sess.pid:
                     socketio.emit("exit", {"code": status}, to=sid)
                     break
     except Exception:
         pass
+    # 注意：这里不关闭 fd，不杀进程。断线后 bash 继续存活，重连复用。
 
 
 @socketio.on("connect")
@@ -177,7 +224,7 @@ def ws_resize(data):
 def ws_disconnect():
     session_key = _sid_to_key.pop(request.sid, "")
     if session_key:
-        terminal.detach_session(session_key)
+        terminal.detach_session(session_key)  # 只标记，不杀进程
 
 
 # ==================== 后台线程 ====================
@@ -187,21 +234,20 @@ def _backup_loop():
         if leader and not leader.is_leader:
             return
         try:
-            size, status = core.backup_database()
-            print(f"[backup] 数据库已加密上传 {size} 字节 (HTTP {status})", flush=True)
+            size, parts = core.backup_database()
+            print(f"[backup] 数据库已加密上传 {size} 字节 ({parts} 分片)", flush=True)
         except Exception as e:
             print(f"[backup] 数据库备份失败: {e}", flush=True)
         try:
             res = core.backup_files()
             if res:
-                size, status = res
-                print(f"[backup] 文件已加密上传 {size} 字节 (HTTP {status})", flush=True)
+                size, parts = res
+                print(f"[backup] 文件已加密上传 {size} 字节 ({parts} 分片)", flush=True)
         except Exception as e:
             print(f"[backup] 文件备份失败: {e}", flush=True)
 
 
 def _report_running():
-    """启动后向 manager 上报 running 状态"""
     mgr_host = os.environ.get("MANAGER_HOST", "ghvps.kekeke.cc.cd")
     try:
         url = f"https://{mgr_host}/api/instances/{config.INSTANCE_ID}/report"
@@ -217,7 +263,6 @@ def _report_running():
 
 
 def _worker_pre_wake():
-    """worker 续命：先检查实例是否仍存在（未被关闭）"""
     done = False
     while True:
         elapsed = _elapsed()
@@ -262,6 +307,8 @@ def run():
     init_cfg = init_instance()
     os.makedirs(config.FILES_DIR, exist_ok=True)
     JOB_STATE["load_status"] = core.load_or_create()
+    _write_shell_profile()
+    _run_setup()  # 后台执行 setup.sh（不阻塞启动）
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)
     from core import LeaderLock

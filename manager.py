@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""管理实例：账号管理 + 实例创建/关闭/查询 + 并发控制（纯 API）"""
+"""管理实例：账号管理（全自动）+ 实例创建/关闭/查询 + 并发控制（纯 API）"""
 import os
 import time
 import json
@@ -41,7 +41,7 @@ def api_status():
                    accounts=accts, instances=insts)
 
 
-# ==================== 账号管理 ====================
+# ==================== 账号管理（全自动） ====================
 @app.route("/api/accounts", methods=["GET"])
 def api_list_accounts():
     return jsonify(ok=True, accounts=accounts.list_accounts())
@@ -49,15 +49,20 @@ def api_list_accounts():
 
 @app.route("/api/accounts", methods=["POST"])
 def api_add_account():
+    """全自动添加账号：验证token → 自动fork仓库 → 自动配secrets → 报备"""
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     token = (data.get("token") or "").strip()
     if not name or not token:
         return jsonify(ok=False, error="name 和 token 必填"), 400
-    res = accounts.add_account(name, token,
-                               repo=data.get("repo"),
-                               max_conc=data.get("max_concurrency"))
-    return jsonify(res)
+    # 后台线程执行（fork + secrets 可能需要几十秒）
+    def _do():
+        res = accounts.auto_provision_account(
+            name, token, repo=data.get("repo"),
+            max_conc=data.get("max_concurrency"))
+        print(f"[account] 添加账号 {name}: {res}", flush=True)
+    threading.Thread(target=_do, daemon=True).start()
+    return jsonify(ok=True, msg=f"账号 {name} 正在全自动配置（fork+secrets），稍后查看 /api/accounts")
 
 
 @app.route("/api/accounts/<name>", methods=["DELETE"])
@@ -94,7 +99,7 @@ def api_close_instance(inst_id):
 
 @app.route("/api/instances/<inst_id>/report", methods=["POST"])
 def api_instance_report(inst_id):
-    """worker 启动后上报状态（由 worker 调用）"""
+    """worker 启动后上报状态"""
     data = request.get_json(silent=True) or {}
     token = data.get("token", "")
     if not config.EXEC_TOKEN or token != config.EXEC_TOKEN:
@@ -132,7 +137,6 @@ def api_instance_exec(inst_id):
         return jsonify(ok=False, error="命令为空"), 400
     timeout = int(data.get("timeout", 30))
     timeout = max(1, min(timeout, 600))
-    # 转发到目标实例
     payload = json.dumps({"token": token, "cmd": cmd, "timeout": timeout}).encode()
     url = f"https://{host}/api/exec"
     try:
@@ -150,7 +154,6 @@ def api_instance_exec(inst_id):
 
 # ==================== 隧道 ====================
 def _start_tunnel():
-    """启动管理实例固定隧道（ghvps.kekeke.cc.cd）"""
     if not config.TUNNEL_TOKEN:
         print("[tunnel] 无 TUNNEL_TOKEN，跳过", flush=True)
         return

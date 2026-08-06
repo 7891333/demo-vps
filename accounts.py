@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
-"""多账号管理：配置存储 + 负载均衡选择"""
+"""多账号管理：配置存储 + 负载均衡 + 全自动创建（fork+配secrets）"""
 import json
+import time
+import base64
+
+from nacl.public import PublicKey, SealedBox
 
 import config
 import core
@@ -18,7 +22,7 @@ def save_accounts(accounts, token=None):
 
 
 def add_account(name, gh_token, repo=None, max_conc=None, token=None):
-    """添加账号。gh_token 为该账号的 GitHub token"""
+    """添加账号（仅报备，不自动创建仓库）"""
     accounts = load_accounts(token=token)
     for a in accounts:
         if a.get("name") == name:
@@ -64,6 +68,81 @@ def list_accounts(token=None):
     return result
 
 
+# ==================== GitHub Secrets 配置（libsodium sealed box） ====================
+def _set_repo_secret(account_token, repo, secret_name, secret_value):
+    """用 GitHub API 配置仓库 secret（libsodium sealed box 加密）"""
+    try:
+        url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
+        status, d = core.gh_request("GET", url, token=account_token)
+        if status != 200:
+            return False
+        key = d["key"]
+        key_id = d["key_id"]
+        pub = PublicKey(base64.b64decode(key))
+        sealed = SealedBox(pub)
+        encrypted = sealed.encrypt(str(secret_value).encode())
+        encrypted_b64 = base64.b64encode(encrypted).decode()
+        url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
+        status, _ = core.gh_request("PUT", url, token=account_token,
+                                    data={"encrypted_value": encrypted_b64, "key_id": key_id})
+        return status in (200, 201, 204)
+    except Exception as e:
+        print(f"[secrets] 配置 {secret_name} 失败: {e}", flush=True)
+        return False
+
+
+def _ensure_repo(account_token, repo_name):
+    """确保账号有仓库（不存在则 fork 主仓库），返回完整 repo 名"""
+    full = f"{repo_name}"
+    status, _ = core.gh_request("GET", f"https://api.github.com/repos/{full}", token=account_token)
+    if status == 200:
+        return full, True
+    # fork 主仓库
+    print(f"[repo] 账号无仓库，fork 主仓库...", flush=True)
+    status, d = core.gh_request("POST", f"https://api.github.com/repos/{config.REPO}/forks",
+                                token=account_token, data={"default_branch_only": True})
+    if status not in (200, 202):
+        return None, False
+    # 等待 fork 完成
+    for _ in range(60):
+        time.sleep(5)
+        status, _ = core.gh_request("GET", f"https://api.github.com/repos/{full}", token=account_token)
+        if status == 200:
+            print(f"[repo] fork 完成: {full}", flush=True)
+            return full, True
+    return None, False
+
+
+def auto_provision_account(name, account_token, repo=None, max_conc=None, manager_token=None):
+    """
+    全自动创建账号：
+    ① 验证 token → ② 确保仓库（自动 fork）→ ③ 配置 secrets → ④ 报备
+    """
+    # 1. 验证 token
+    status, user = core.gh_request("GET", "https://api.github.com/user", token=account_token)
+    if status != 200:
+        return {"ok": False, "error": f"token 无效（{status}）"}
+    login = user.get("login", "")
+
+    # 2. 确保仓库
+    if not repo:
+        repo = f"{login}/{config.REPO.split('/')[-1]}"
+    repo, ok = _ensure_repo(account_token, repo)
+    if not ok:
+        return {"ok": False, "error": "仓库准备失败（fork 超时或失败）"}
+
+    # 3. 配置 secrets
+    ok1 = _set_repo_secret(account_token, repo, "GH_TOKEN", account_token)
+    ok2 = _set_repo_secret(account_token, repo, "DEMO_KEY", config.DEMO_KEY)
+    ok3 = _set_repo_secret(account_token, repo, "EXEC_TOKEN", config.EXEC_TOKEN)
+    if not (ok1 and ok2 and ok3):
+        return {"ok": False, "error": "secrets 配置失败"}
+
+    # 4. 报备
+    return add_account(name, account_token, repo=repo, max_conc=max_conc, token=manager_token)
+
+
+# ==================== 负载均衡 ====================
 def _account_usage(account, workflow=None):
     """查询账号【自己仓库】当前 worker 运行数（并发检测）"""
     try:
@@ -75,7 +154,6 @@ def _account_usage(account, workflow=None):
             return 0
         runs = data.get("workflow_runs", [])
         if workflow:
-            # path 形如 ".github/workflows/worker.yml"，用包含匹配
             return sum(1 for r in runs if workflow in r.get("path", ""))
         return len(runs)
     except Exception:
@@ -87,12 +165,12 @@ def select_best_account(token=None, workflow=None):
     accounts = load_accounts(token=token)
     if not accounts:
         return None
-    best = None  # {"account", "running", "max_concurrency"}
+    best = None
     for acc in accounts:
         running = _account_usage(acc, workflow=workflow)
         max_c = acc.get("max_concurrency", config.DEFAULT_MAX_CONCURRENCY)
         if running >= max_c:
-            continue  # 该账号已满
+            continue
         if best is None or (max_c - running) > (best["max_concurrency"] - best["running"]):
             best = {"account": acc, "running": running, "max_concurrency": max_c}
     if best is None:

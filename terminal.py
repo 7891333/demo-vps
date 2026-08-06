@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WSS 交互式终端：PTY + bytes 传输（修复乱码）+ pyte 终端模拟（干净文本）"""
+"""WSS 交互式终端：PTY + bytes 传输 + pyte + 断线无缝（不杀前台进程）"""
 import os
 import pty
 import time
@@ -19,43 +19,44 @@ _lock = threading.Lock()
 
 
 class Session:
-    def __init__(self, key, cols=100, rows=30):
+    def __init__(self, key, cols=120, rows=35):
         self.key = key
         self.cols = cols
         self.rows = rows
         self.pid, self.fd = self._spawn()
         self.last_active = time.time()
-        self.attached = True
-        # pyte 终端模拟：维护干净逻辑屏幕（供复制/导出）
+        self.attached = True  # 当前是否有客户端连接
+        # pyte 终端模拟：维护干净逻辑屏幕
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
 
     @staticmethod
     def _spawn():
+        """创建 PTY 并启动 bash（UTF-8 locale + 免密 sudo 环境）"""
         pid, fd = pty.fork()
         if pid == 0:
             env = os.environ.copy()
             env["LANG"] = "C.UTF-8"
             env["LC_ALL"] = "C.UTF-8"
             env["TERM"] = "xterm-256color"
+            # 默认进入持久化目录，PS1 显示 kodebite
+            env["GHVPS_PERSIST_DIR"] = config.FILES_DIR
             os.execvpe("/bin/bash", ["bash", "--login"], env)
         return pid, fd
 
     def feed(self, data: bytes):
-        """把 PTY 输出喂给 pyte（维护干净屏幕），不影响原始 bytes 传输"""
         try:
             self.stream.feed(data.decode("utf-8", errors="replace"))
         except Exception:
             pass
 
     def get_screen(self):
-        """返回当前逻辑屏幕的干净文本（用于复制/导出）"""
         try:
             return "\n".join(self.screen.display)
         except Exception:
             return ""
 
-    def read_output(self, chunk=4096):
+    def read_output(self, chunk=8192):
         try:
             return os.read(self.fd, chunk)
         except OSError:
@@ -77,7 +78,10 @@ class Session:
             pass
 
     def destroy(self):
+        """真正销毁会话（仅超时清理或显式关闭时调用）"""
         try:
+            os.kill(self.pid, signal.SIGHUP)  # 先 SIGHUP 让 bash 优雅退出
+            time.sleep(0.2)
             os.kill(self.pid, signal.SIGKILL)
         except Exception:
             pass
@@ -88,6 +92,7 @@ class Session:
 
 
 def get_or_create_session(session_key: str) -> Session:
+    """根据 session_key 复用已有会话（断线重连），否则新建"""
     with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
@@ -100,6 +105,7 @@ def get_or_create_session(session_key: str) -> Session:
 
 
 def detach_session(session_key: str):
+    """断线时标记会话未连接（不杀进程，保留 bash 和前台进程）"""
     with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
@@ -120,6 +126,7 @@ def get_screen(session_key: str):
 
 
 def cleanup_loop():
+    """清理超过 SESSION_TTL 未重连的会话"""
     while True:
         time.sleep(30)
         now = time.time()
