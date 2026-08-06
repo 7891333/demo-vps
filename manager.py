@@ -189,6 +189,40 @@ def api_instance_exec(inst_id):
 
 
 # ==================== 健康监控 + 自动恢复 ====================
+
+
+def _account_suspended(account):
+    """检测账号是否被封（GitHub 返回 Account suspended）"""
+    try:
+        status, d = core.gh_request("GET", "https://api.github.com/user", token=account.get("token"))
+        if status == 403:
+            msg = d.get("message", "") if isinstance(d, dict) else str(d)
+            if "suspended" in str(msg).lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _auto_cleanup_account(account):
+    """账号被封：自动关闭该账号所有实例 + 移除账号"""
+    print(f"[auto-cleanup] 检测到账号 {account['name']} 被封，自动清理...", flush=True)
+    insts = instances.list_instances()
+    for inst in insts:
+        if inst.get("account") == account.get("name") and not inst.get("closed"):
+            try:
+                instances.close_instance(inst["id"])
+                print(f"[auto-cleanup] 已关闭实例 {inst['id']}", flush=True)
+            except Exception as e:
+                print(f"[auto-cleanup] 关闭 {inst['id']} 失败: {e}", flush=True)
+    # 移除账号
+    try:
+        accounts.remove_account(account["name"])
+        print(f"[auto-cleanup] 已移除账号 {account['name']}", flush=True)
+    except Exception as e:
+        print(f"[auto-cleanup] 移除账号失败: {e}", flush=True)
+
+
 def _check_health(host):
     try:
         req = urllib.request.Request(f"https://{host}/api/health",
@@ -234,9 +268,18 @@ def _health_monitor_loop():
                     _fail_counts[inst["id"]] = n
                     print(f"[monitor] 实例 {inst['id']} 健康检查失败 {n}/3", flush=True)
                     if n >= 3:
-                        _restart_instance(inst)
-                        _fail_counts[inst["id"]] = 0
-                        inst["status"] = "restarting"
+                        # 检测该实例账号是否被封
+                        account = next((a for a in accounts.load_accounts()
+                                        if a["name"] == inst.get("account")), None)
+                        if account and _account_suspended(account):
+                            # 账号被封：自动清理整个账号
+                            _auto_cleanup_account(account)
+                            _fail_counts[inst["id"]] = 0
+                        else:
+                            # 实例异常：自动重启
+                            _restart_instance(inst)
+                            _fail_counts[inst["id"]] = 0
+                            inst["status"] = "restarting"
                         changed = True
             if changed:
                 instances.save_instances(insts)

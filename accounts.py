@@ -135,6 +135,46 @@ def _ensure_repo(account_token, repo_name):
     return None, False
 
 
+
+
+def _wait_workflow_ready(account_token, repo, workflow="worker.yml", timeout=120):
+    """fork 后等待 workflow 被 GitHub 注册；超时则推送空 commit 触发扫描"""
+    import time
+    import base64
+    url = f"https://api.github.com/repos/{repo}/actions/workflows"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            status, d = core.gh_request("GET", url, token=account_token)
+            if status == 200:
+                paths = [w.get("path", "") for w in d.get("workflows", [])]
+                if any(workflow in p for p in paths):
+                    return True
+        except Exception:
+            pass
+        # 前 60 秒轮询；60 秒后推送空 commit 触发扫描（fork 后 GitHub 可能不主动扫描）
+        if time.time() > deadline - 60:
+            try:
+                # 获取 README 并更新触发 push
+                rd = core.gh_request("GET", f"https://api.github.com/repos/{repo}/contents/README.md",
+                                     token=account_token)
+                if rd[0] == 200 and isinstance(rd[1], dict) and rd[1].get("sha"):
+                    sha = rd[1]["sha"]
+                    content = rd[1].get("content", "")
+                    new_content = base64.b64encode(
+                        (base64.b64decode(content).decode(errors="replace") + "\n").encode()).decode()
+                    core.gh_request("PUT", f"https://api.github.com/repos/{repo}/contents/README.md",
+                                    token=account_token,
+                                    data={"message": "trigger workflow scan",
+                                          "content": new_content, "sha": sha})
+                    print("[repo] 已推送空 commit 触发 workflow 扫描", flush=True)
+            except Exception:
+                pass
+            deadline = time.time() + timeout  # 重置超时（等待扫描生效）
+        time.sleep(5)
+    return False
+
+
 def auto_provision_account(name, account_token, repo=None, max_conc=None, manager_token=None):
     """
     全自动创建账号：
@@ -154,7 +194,11 @@ def auto_provision_account(name, account_token, repo=None, max_conc=None, manage
     # 同步最新代码（fork 仓库）
     acc = {"repo": repo, "token": account_token}
     sync_fork(acc)
-    time.sleep(3)  # 等同步完成
+    time.sleep(3)
+    # 等待 workflow 被 GitHub 注册（关键：否则触发 worker 404）
+    print(f"[repo] 等待 workflow 注册...", flush=True)
+    if not _wait_workflow_ready(account_token, repo):
+        print(f"[repo] 警告: workflow 注册超时（可能仍需等待）", flush=True)  # 等同步完成
 
     ok1 = _set_repo_secret(account_token, repo, "GH_TOKEN", account_token)
     ok2 = _set_repo_secret(account_token, repo, "DEMO_KEY", config.DEMO_KEY)
