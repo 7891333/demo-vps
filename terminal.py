@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WSS 交互式终端：PTY + bytes 传输 + pyte + 断线无缝（不杀前台进程）"""
+"""WSS 交互式终端：PTY + bytes 传输 + pyte + 断线无缝（不杀前台进程）+ 默认 root"""
 import os
 import pty
 import time
@@ -32,16 +32,15 @@ class Session:
 
     @staticmethod
     def _spawn():
-        """创建 PTY 并启动 bash（UTF-8 locale + 免密 sudo 环境）"""
+        """创建 PTY 并启动 root shell（runner 有免密 sudo）"""
         pid, fd = pty.fork()
         if pid == 0:
             env = os.environ.copy()
             env["LANG"] = "C.UTF-8"
             env["LC_ALL"] = "C.UTF-8"
             env["TERM"] = "xterm-256color"
-            # 默认进入持久化目录，PS1 显示 kodebite
-            env["GHVPS_PERSIST_DIR"] = config.FILES_DIR
-            os.execvpe("/bin/bash", ["bash", "--login"], env)
+            # 默认以 root 运行（sudo -i 进入 root 登录 shell，读 /root/.bashrc）
+            os.execvpe("sudo", ["sudo", "-i"], env)
         return pid, fd
 
     def feed(self, data: bytes):

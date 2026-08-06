@@ -65,25 +65,37 @@ def _system_trim():
 
 # ==================== 终端配置 ====================
 def _write_shell_profile():
-    """生成 .bashrc：PS1 显示 kodebite + 默认进入持久化目录"""
-    home = os.path.expanduser("~")
-    persist = config.FILES_DIR
+    """生成终端配置：root 用户 + kodebite + 默认进入持久化目录"""
+    persist = config.FILES_DIR  # 绝对路径 /home/runner/files
     os.makedirs(persist, exist_ok=True)
-    bashrc = f"""# GitHub Actions 云端终端配置
+    try:
+        # runner 用户的 bashrc（供 /api/exec 等使用）
+        home = os.path.expanduser("~")
+        bashrc = f"""# GitHub Actions 云端终端配置
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export TERM=xterm-256color
-export PS1='\\[\\e[32m\\]kodebite@kodebite\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '
+export PS1='\[\e[32m\]kodebite@kodebite\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
 cd {persist} 2>/dev/null || true
 alias sudo='sudo '
 """
-    try:
         with open(os.path.join(home, ".bashrc"), "w") as f:
             f.write(bashrc)
         with open(os.path.join(home, ".bash_profile"), "w") as f:
             f.write("source ~/.bashrc 2>/dev/null\n")
+        # root 用户的 bashrc（WSS 终端默认 root 登录时读取）
+        root_bashrc = f"""# root 终端配置
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export TERM=xterm-256color
+export PS1='\[\e[31m\]root@kodebite\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]# '
+cd {persist} 2>/dev/null || true
+"""
+        with open("/root/.bashrc", "w") as f:
+            f.write(root_bashrc)
         subprocess.run("sudo hostname kodebite 2>/dev/null || hostname kodebite 2>/dev/null",
                        shell=True, timeout=5)
+        print("[shell] 终端配置完成（root + kodebite + 持久化目录）", flush=True)
     except Exception as e:
         print(f"[shell] 配置写入失败: {e}", flush=True)
 
