@@ -21,31 +21,33 @@ for name, ok in [("DEMO_KEY", config.DEMO_KEY), ("GH_TOKEN", config.GH_TOKEN),
 os.makedirs(config.FILES_DIR, exist_ok=True)
 web.JOB_STATE["load_status"] = core.load_or_create()
 
+# ==================== 备份线程（leader 专用） ====================
+def _backup_loop():
+    while True:
+        import time
+        time.sleep(config.BACKUP_INTERVAL)
+        if not lock.is_leader:
+            return
+        try:
+            size, status = core.backup_database()
+            print(f"[backup] 数据库已加密上传 {size} 字节 (HTTP {status})", flush=True)
+        except Exception as e:
+            print(f"[backup] 数据库备份失败: {e}", flush=True)
+        try:
+            res = core.backup_files()
+            if res:
+                size, status = res
+                print(f"[backup] 文件已加密上传 {size} 字节 (HTTP {status})", flush=True)
+        except Exception as e:
+            print(f"[backup] 文件备份失败: {e}", flush=True)
+
+
 # ==================== 主 job 锁 ====================
 lock = LeaderLock()
 lock.acquire()
 
 # ==================== 后台线程 ====================
 if lock.is_leader:
-    def _backup_loop():
-        while True:
-            import time
-            time.sleep(config.BACKUP_INTERVAL)
-            if not lock.is_leader:
-                return
-            try:
-                size, status = core.backup_database()
-                print(f"[backup] 数据库已加密上传 {size} 字节 (HTTP {status})", flush=True)
-            except Exception as e:
-                print(f"[backup] 数据库备份失败: {e}", flush=True)
-            try:
-                res = core.backup_files()
-                if res:
-                    size, status = res
-                    print(f"[backup] 文件已加密上传 {size} 字节 (HTTP {status})", flush=True)
-            except Exception as e:
-                print(f"[backup] 文件备份失败: {e}", flush=True)
-
     threading.Thread(target=_backup_loop, daemon=True).start()
     threading.Thread(target=lock.heartbeat_loop, daemon=True).start()
 else:

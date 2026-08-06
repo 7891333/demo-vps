@@ -23,7 +23,7 @@ class Session:
         self.key = key
         self.pid, self.fd = self._spawn()
         self.last_active = time.time()  # 最近活跃时间
-        self.connected = True  # 当前是否有客户端连接
+        self.attached = True  # 当前是否有客户端连接
 
     @staticmethod
     def _spawn():
