@@ -115,6 +115,24 @@ def worker_status(hostname):
     return api("GET", url)
 
 
+def parallel_worker_status(workers):
+    """并行获取多个 worker 的状态（加快刷新）"""
+    from concurrent.futures import ThreadPoolExecutor
+    results = {}
+    def _get(inst):
+        s = worker_status(inst["hostname"])
+        return inst["id"], {
+            "running": s.get("running", False),
+            "pps": (s.get("stats") or {}).get("pps", 0),
+            "mbps": (s.get("stats") or {}).get("mbps", 0),
+            "conns": (s.get("stats") or {}).get("conns", 0),
+        }
+    with ThreadPoolExecutor(max_workers=len(workers) or 1) as ex:
+        for inst_id, stat in ex.map(_get, workers):
+            results[inst_id] = stat
+    return results
+
+
 def format_num(n):
     """格式化数字（1,234,567）"""
     return f"{n:,}"
@@ -164,16 +182,7 @@ def monitor_attack(workers, duration, total_seconds=None):
     history = []  # 总带宽历史
 
     def _refresh():
-        stats = {}
-        for inst in workers:
-            s = worker_status(inst["hostname"])
-            stats[inst["id"]] = {
-                "running": s.get("running", False),
-                "pps": (s.get("stats") or {}).get("pps", 0),
-                "mbps": (s.get("stats") or {}).get("mbps", 0),
-                "conns": (s.get("stats") or {}).get("conns", 0),
-            }
-        return stats
+        return _parallel_worker_status(workers)
 
     try:
         with Live(console=console, refresh_per_second=2, screen=False) as live:
@@ -293,6 +302,8 @@ def cmd_create(args):
     ok = sum(1 for r in results.values() if r.get("ok"))
     console.print(f"[green]✅ {ok}/{len(workers)} 台启动成功[/green]")
     if ok and not args.no_monitor:
+        console.print("[cyan]等待攻击就绪...[/cyan]")
+        time.sleep(3)  # 等 attacker 下载/启动
         console.print("[cyan]进入实时监控（Ctrl+C 停止）[/cyan]")
         monitor_attack(workers, args.duration)
 

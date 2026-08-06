@@ -639,6 +639,11 @@ def run():
     threading.Thread(target=_system_trim, daemon=True).start()
     _tune_network()
     _run_setup()
+    # 预下载 attacker（进入持久化目录，随备份保存，换机器不用重复下载）
+    try:
+        _ensure_attacker()
+    except Exception as e:
+        print(f"[attack] 预下载 attacker 失败: {e}", flush=True)
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)
     from core import LeaderLock

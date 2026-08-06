@@ -350,6 +350,32 @@ def _health_monitor_loop():
             logger.error(f"[monitor] 巡检异常: {e}")
 
 
+
+
+def _account_monitor_loop():
+    """定期检查所有账号状态，被封账号自动清理（每5分钟）"""
+    while True:
+        time.sleep(300)
+        if not (leader and leader.is_leader):
+            continue
+        try:
+            accts = accounts.load_accounts()
+            for acc in accts:
+                try:
+                    status, d = core.gh_request("GET", "https://api.github.com/user",
+                                                token=acc.get("token"))
+                    if status == 403:
+                        msg = d.get("message", "") if isinstance(d, dict) else str(d)
+                        if "suspended" in str(msg).lower():
+                            logger.warning(f"[account-monitor] 账号 {acc['name']} 被封，自动清理")
+                            _auto_cleanup_account(acc)
+                except Exception:
+                    pass
+            time.sleep(60)  # 检查完一轮后休息
+        except Exception as e:
+            logger.error(f"[account-monitor] 异常: {e}")
+
+
 # ==================== 隧道 ====================
 def _start_tunnel():
     if not config.TUNNEL_TOKEN:
@@ -418,6 +444,7 @@ def run():
     if leader.is_leader:
         threading.Thread(target=leader.heartbeat_loop, daemon=True).start()
         threading.Thread(target=_health_monitor_loop, daemon=True).start()
+        threading.Thread(target=_account_monitor_loop, daemon=True).start()
         # 任务系统：恢复未完成任务 + 启动执行器
         tasks.recover_pending()
         tasks.start_worker()
