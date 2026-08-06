@@ -297,6 +297,19 @@ def _report_running():
         print(f"[report] 上报失败: {e}", flush=True)
 
 
+
+
+def _save_prev_backup():
+    """保存上一版备份快照（用于数据回滚）"""
+    try:
+        blob = core.download_asset_chunked(config.ASSET_DB)
+        if blob:
+            core.upload_asset_chunked(f"{config.ASSET_DB}.bak", blob)
+            print("[backup] 已保存上一版数据库快照", flush=True)
+    except Exception as e:
+        print(f"[backup] 保存快照失败: {e}", flush=True)
+
+
 def _worker_pre_wake():
     done = False
     while True:
@@ -372,6 +385,7 @@ def run():
     init_cfg = init_instance()
     os.makedirs(config.FILES_DIR, exist_ok=True)
     JOB_STATE["load_status"] = core.load_or_create()
+    _save_prev_backup()
     _write_shell_profile()
     threading.Thread(target=_system_trim, daemon=True).start()
     _run_setup()
