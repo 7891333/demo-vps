@@ -17,6 +17,13 @@ def load_instances(token=None):
 
 
 def save_instances(instances, token=None):
+    """保存实例清单（防数据丢失：空数据不覆盖已有数据）"""
+    if not instances:
+        # 防止空数据覆盖：若 Releases 已有非空清单，拒绝覆盖
+        existing = load_instances(token=token)
+        if existing:
+            print("[protect] 拒绝空数据覆盖实例清单", flush=True)
+            return
     core.save_json_enc(config.ASSET_INSTANCES, instances, token=token)
 
 

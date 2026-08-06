@@ -67,6 +67,13 @@ def require_auth(f):
     return wrapper
 
 
+def _require_leader():
+    """写操作要求 leader（防止多 manager 并行写数据冲突）"""
+    if not (leader and leader.is_leader):
+        return False
+    return True
+
+
 def _api_token_headers():
     return {"Content-Type": "application/json",
             "Authorization": f"Bearer {config.EXEC_TOKEN}",
@@ -162,6 +169,8 @@ def api_list_tasks():
 @app.route("/api/accounts/<name>", methods=["DELETE"])
 @require_auth
 def api_remove_account(name):
+    if not _require_leader():
+        return jsonify(ok=False, error="当前为备份节点，写操作被拒绝"), 503
     res = accounts.remove_account(name)
     logger.info(f"[api] 删除账号 {name}: {res}")
     return jsonify(res)
@@ -171,6 +180,8 @@ def api_remove_account(name):
 @app.route("/api/instances", methods=["POST"])
 @require_auth
 def api_create_instance():
+    if not _require_leader():
+        return jsonify(ok=False, error="当前为备份节点，写操作被拒绝"), 503
     res = instances.create_instance()
     logger.info(f"[api] 创建实例: {res.get('msg', res.get('error'))}")
     return jsonify(res), (200 if res.get("ok") else 409)
@@ -194,6 +205,8 @@ def api_get_instance(inst_id):
 @app.route("/api/instances/<inst_id>", methods=["DELETE"])
 @require_auth
 def api_close_instance(inst_id):
+    if not _require_leader():
+        return jsonify(ok=False, error="当前为备份节点，写操作被拒绝"), 503
     res = instances.close_instance(inst_id)
     _fail_counts.pop(inst_id, None)
     logger.info(f"[api] 关闭实例 {inst_id}: {res.get('msg', res.get('error'))}")
@@ -210,6 +223,8 @@ def api_instance_report(inst_id):
         return jsonify(ok=False, error=f"实例 {inst_id} 不存在"), 404
     inst["status"] = "running"
     inst["url"] = data.get("url", inst.get("url"))
+    if not _require_leader():
+        return jsonify(ok=False, error="当前为备份节点，写操作被拒绝"), 503
     inst["last_seen"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     all_insts = instances.load_instances()
     for i in all_insts:

@@ -17,7 +17,12 @@ def load_accounts(token=None):
 
 
 def save_accounts(accounts, token=None):
-    """保存账号配置（加密）"""
+    """保存账号配置（防数据丢失：空数据不覆盖已有数据）"""
+    if not accounts:
+        existing = load_accounts(token=token)
+        if existing:
+            print("[protect] 拒绝空数据覆盖账号配置", flush=True)
+            return
     core.save_json_enc(config.ASSET_ACCOUNTS, accounts, token=token)
 
 
