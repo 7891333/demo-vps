@@ -301,10 +301,11 @@ class LeaderLock:
                 pass
 
     def follower_loop(self, on_promote):
+        """follower 每 FOLLOWER_CHECK 秒检查 leader，过期立即升级（缩短交接缝）"""
         while True:
             if self.is_leader:
                 return
-            time.sleep(config.HEARTBEAT_INTERVAL)
+            time.sleep(config.FOLLOWER_CHECK)
             try:
                 leader = self._read()
                 now = time.time()
@@ -314,6 +315,11 @@ class LeaderLock:
                         return
             except Exception:
                 pass
+
+    def check_and_takeover(self):
+        """新实例启动时立即检查：leader 过期则直接接管（不等 follower 周期）"""
+        if not self.is_leader:
+            self.acquire()
 
 
 # ==================== 续命 ====================
@@ -359,3 +365,42 @@ def auto_update_loop(workflow, instance_id=None, token=None):
                 os._exit(0)
         except Exception as e:
             print(f"[update] 检查失败: {e}", flush=True)
+
+# ==================== 任务持久化（manager 后台任务队列） ====================
+def save_tasks(tasks, token=None):
+    """保存任务队列（加密）"""
+    save_json_enc(config.ASSET_TASKS, tasks, token=token)
+
+
+def load_tasks(token=None):
+    """加载任务队列"""
+    data = load_json_enc(config.ASSET_TASKS, token=token, default=[])
+    return data if isinstance(data, list) else []
+
+
+def add_task(task_type, params, token=None):
+    """添加任务，返回任务 dict"""
+    tasks = load_tasks(token=token)
+    task = {
+        "id": f"{task_type}-{uuid.uuid4().hex[:8]}",
+        "type": task_type,
+        "params": params,
+        "status": "pending",   # pending/running/done/failed
+        "error": "",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    tasks.append(task)
+    save_tasks(tasks, token=token)
+    return task
+
+
+def update_task(task_id, token=None, **fields):
+    """更新任务状态"""
+    tasks = load_tasks(token=token)
+    for t in tasks:
+        if t.get("id") == task_id:
+            t.update(fields)
+            t["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            break
+    save_tasks(tasks, token=token)

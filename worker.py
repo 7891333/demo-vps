@@ -16,7 +16,10 @@ from flask_socketio import SocketIO, emit
 
 import config
 import core
+
+logger = log.setup_logger("worker")
 import terminal
+import log
 
 
 # ==================== 实例初始化 ====================
@@ -162,6 +165,17 @@ def api_status():
                    url=JOB_STATE["last_url"], source=JOB_STATE["load_status"],
                    tunnel_host=config.TUNNEL_HOST)
 
+
+
+
+@app.route("/api/logs")
+def api_logs():
+    """查看服务器完整日志"""
+    limit = int(request.args.get("limit", 300))
+    limit = max(10, min(limit, 2000))
+    level = request.args.get("level")
+    logs = log.get_logs(limit=limit, level=level)
+    return jsonify(ok=True, logs=logs, stats=log.get_stats())
 
 @app.route("/api/health")
 def api_health():
@@ -567,4 +581,5 @@ def run():
     threading.Thread(target=_worker_pre_wake, daemon=True).start()
     threading.Thread(target=_auto_update_loop, daemon=True).start()
     terminal.start_cleanup()
+    log.request_logger(app)
     socketio.run(app, host="0.0.0.0", port=config.PORT, allow_unsafe_werkzeug=True)

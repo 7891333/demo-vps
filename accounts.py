@@ -94,8 +94,13 @@ def sync_fork(account):
 
 # ==================== GitHub Secrets 配置（libsodium sealed box） ====================
 def _set_repo_secret(account_token, repo, secret_name, secret_value):
-    """用 GitHub API 配置仓库 secret（libsodium sealed box 加密）"""
+    """用 GitHub API 配置仓库 secret（libsodium sealed box 加密），幂等：已配则跳过"""
     try:
+        # 检查是否已配置
+        chk = core.gh_request("GET", f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}",
+                              token=account_token)
+        if chk[0] == 200 and isinstance(chk[1], dict) and chk[1].get("name"):
+            return True  # 已配置，跳过
         url = f"https://api.github.com/repos/{repo}/actions/secrets/public-key"
         status, d = core.gh_request("GET", url, token=account_token)
         if status != 200:
@@ -175,37 +180,54 @@ def _wait_workflow_ready(account_token, repo, workflow="worker.yml", timeout=120
     return False
 
 
+def _check_repo_secret(account_token, repo, secret_name):
+    """检查仓库 secret 是否已配置（幂等）"""
+    url = f"https://api.github.com/repos/{repo}/actions/secrets/{secret_name}"
+    status, _ = core.gh_request("GET", url, token=account_token)
+    return status == 200
+
+
 def auto_provision_account(name, account_token, repo=None, max_conc=None, manager_token=None):
     """
-    全自动创建账号：
-    ① 验证 token → ② 确保仓库（自动 fork）→ ③ 同步最新代码 → ④ 配置 secrets → ⑤ 报备
+    全自动创建账号（幂等，可重复执行）：
+    ① 验证 token → ② 确保仓库（存在则跳过）→ ③ 同步代码 → ④ 等待 workflow
+    → ⑤ 配 secrets（已配跳过）→ ⑥ 报备（已报备更新）
     """
+    # ① 验证 token
     status, user = core.gh_request("GET", "https://api.github.com/user", token=account_token)
     if status != 200:
         return {"ok": False, "error": f"token 无效（{status}）"}
     login = user.get("login", "")
 
+    # ② 确保仓库（幂等：已存在则跳过 fork）
     if not repo:
         repo = f"{login}/{config.REPO.split('/')[-1]}"
     repo, ok = _ensure_repo(account_token, repo)
     if not ok:
         return {"ok": False, "error": "仓库准备失败（fork 超时或失败）"}
 
-    # 同步最新代码（fork 仓库）
+    # ③ 同步最新代码（幂等）
     acc = {"repo": repo, "token": account_token}
     sync_fork(acc)
     time.sleep(3)
-    # 等待 workflow 被 GitHub 注册（关键：否则触发 worker 404）
-    print(f"[repo] 等待 workflow 注册...", flush=True)
+
+    # ④ 等待 workflow 注册（关键；已注册则快速通过）
     if not _wait_workflow_ready(account_token, repo):
-        print(f"[repo] 警告: workflow 注册超时（可能仍需等待）", flush=True)  # 等同步完成
+        return {"ok": False, "error": "workflow 注册超时（稍后自动重试）"}
 
-    ok1 = _set_repo_secret(account_token, repo, "GH_TOKEN", account_token)
-    ok2 = _set_repo_secret(account_token, repo, "DEMO_KEY", config.DEMO_KEY)
-    ok3 = _set_repo_secret(account_token, repo, "EXEC_TOKEN", config.EXEC_TOKEN)
-    if not (ok1 and ok2 and ok3):
-        return {"ok": False, "error": "secrets 配置失败"}
+    # ⑤ 配 secrets（幂等：已配置的跳过）
+    needed = {"GH_TOKEN": account_token, "DEMO_KEY": config.DEMO_KEY,
+              "EXEC_TOKEN": config.EXEC_TOKEN}
+    all_ok = True
+    for sname, sval in needed.items():
+        if not _check_repo_secret(account_token, repo, sname):
+            if not _set_repo_secret(account_token, repo, sname, sval):
+                all_ok = False
+                print(f"[secrets] {sname} 配置失败", flush=True)
+    if not all_ok:
+        return {"ok": False, "error": "secrets 配置失败（将自动重试）"}
 
+    # ⑥ 报备（幂等：已报备则更新）
     return add_account(name, account_token, repo=repo, max_conc=max_conc, token=manager_token)
 
 

@@ -36,7 +36,7 @@ ASSET_INSTANCES = "instances.json.enc" # 实例清单（加密）
 
 # ==================== 主 job 锁 ====================
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
-HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "90"))
+HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "60"))
 
 # ==================== 数据/文件 ====================
 DB_FILE = "demo.db"
@@ -47,7 +47,12 @@ PORT = int(os.environ.get("PORT", "8080"))
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))
 
 # ==================== 无缝衔接 ====================
-PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21300"))
+PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))
+
+# follower 检查 leader 过期的间隔（快速升级，缩短交接缝）
+FOLLOWER_CHECK = int(os.environ.get("FOLLOWER_CHECK", "15"))
+# 任务持久化 asset（manager 后台任务队列）
+ASSET_TASKS = "tasks.json.enc"
 
 # ==================== WSS 终端会话 ====================
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "300"))
