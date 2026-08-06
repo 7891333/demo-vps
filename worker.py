@@ -16,10 +16,10 @@ from flask_socketio import SocketIO, emit
 
 import config
 import core
+import log
+import terminal
 
 logger = log.setup_logger("worker")
-import terminal
-import log
 
 
 # ==================== 实例初始化 ====================
