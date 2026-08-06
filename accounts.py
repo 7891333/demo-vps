@@ -22,7 +22,6 @@ def add_account(name, gh_token, repo=None, max_conc=None, token=None):
     accounts = load_accounts(token=token)
     for a in accounts:
         if a.get("name") == name:
-            # 更新已有账号
             a["token"] = gh_token
             if repo:
                 a["repo"] = repo
@@ -79,16 +78,14 @@ def select_best_account(token=None, workflow=None):
     accounts = load_accounts(token=token)
     if not accounts:
         return None
-    best = None
-    best_running = None
+    best = None  # {"account", "running", "max_concurrency"}
     for acc in accounts:
         running = _account_usage(acc, workflow=workflow)
         max_c = acc.get("max_concurrency", config.DEFAULT_MAX_CONCURRENCY)
         if running >= max_c:
             continue  # 该账号已满
-        if best is None or (max_c - running) > (best["max_c"] - best["running"]):
+        if best is None or (max_c - running) > (best["max_concurrency"] - best["running"]):
             best = {"account": acc, "running": running, "max_concurrency": max_c}
-            best_running = running
     if best is None:
         return None
     return best["account"], best["running"]
