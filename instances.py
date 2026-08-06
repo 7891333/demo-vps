@@ -100,7 +100,8 @@ def create_instance(manager_token=None):
 
     instances = load_instances(token=manager_token)
     inst_id = _next_inst_id(instances)
-    hostname = f"{inst_id}.{config.TUNNEL_PREFIX}.{config.BASE_DOMAIN}"
+    # 用一级子域名（如 inst1.kekeke.cc.cd），确保被 *.kekeke.cc.cd 通配符证书覆盖
+    hostname = f"{inst_id}.{config.BASE_DOMAIN}"
 
     # 2. 创建 CF 隧道（全自动）
     try:
