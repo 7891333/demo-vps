@@ -377,7 +377,7 @@ def start_tunnel():
 
 # ==================== Flask 站点 ====================
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading", ping_interval=30, ping_timeout=90)
 
 
 def get_conn():
@@ -626,101 +626,138 @@ def exec_cmd():
         return jsonify(ok=False, error=str(e)), 500
 
 
-# ==================== WSS 交互式终端（类 SSH） ====================
-active_ptys = {}  # sid -> (pid, fd)
+# ==================== WSS 交互式终端（类 SSH，PTY 会话持久化） ====================
+active_ptys = {}  # session_id -> {"pid","fd","sid","connected","last_seen"}
+PTY_IDLE_TIMEOUT = int(os.environ.get("PTY_IDLE_TIMEOUT", "600"))  # 无连接超过10分钟清理
 
 
-def pty_reader(sid, pid, fd):
-    """读取 PTY 输出并推送给客户端"""
+def pty_alive(item):
+    """检查 PTY 子进程是否还活着"""
     try:
-        while True:
-            r, _, _ = select.select([fd], [], [], 1.0)
-            if r:
-                try:
-                    data = os.read(fd, 4096)
-                except OSError:
-                    break
-                if not data:
-                    break
-                socketio.emit("output", data.decode(errors="replace"), to=sid)
-            else:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    socketio.emit("exit", {"code": status}, to=sid)
-                    break
-    except Exception:
-        pass
-    finally:
+        wpid, status = os.waitpid(item["pid"], os.WNOHANG)
+        return wpid != item["pid"]
+    except ChildProcessError:
+        return False
+
+
+def get_or_create_pty(session_id):
+    """获取或创建 PTY 会话（session 复用，断线重连无痕）"""
+    item = active_ptys.get(session_id)
+    if item and pty_alive(item):
+        item["last_seen"] = time.time()
+        return item
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-256color"
+        os.execvp("/bin/bash", ["bash", "--login"])
+    item = {"pid": pid, "fd": fd, "sid": None, "connected": False, "last_seen": time.time()}
+    active_ptys[session_id] = item
+    threading.Thread(target=pty_reader, args=(session_id,), daemon=True).start()
+    return item
+
+
+def _cleanup_pty(session_id):
+    """清理 PTY 会话"""
+    item = active_ptys.pop(session_id, None)
+    if item:
         try:
-            os.close(fd)
+            os.kill(item["pid"], signal.SIGKILL)
         except Exception:
             pass
-        active_ptys.pop(sid, None)
+        try:
+            os.close(item["fd"])
+        except Exception:
+            pass
+        print(f"[ws] 已清理 PTY 会话: {session_id}", flush=True)
+
+
+def pty_reader(session_id):
+    """读取 PTY 输出并推送给当前连接的客户端"""
+    item = active_ptys.get(session_id)
+    if not item:
+        return
+    while True:
+        r, _, _ = select.select([item["fd"]], [], [], 1.0)
+        if r:
+            try:
+                data = os.read(item["fd"], 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            sid = item.get("sid")
+            if sid:
+                socketio.emit("output", data.decode(errors="replace"), to=sid)
+        else:
+            if not pty_alive(item):
+                sid = item.get("sid")
+                if sid:
+                    socketio.emit("exit", {"code": 0}, to=sid)
+                _cleanup_pty(session_id)
+                break
+            # 无连接且超时则清理
+            if not item.get("connected") and time.time() - item["last_seen"] > PTY_IDLE_TIMEOUT:
+                _cleanup_pty(session_id)
+                break
 
 
 @socketio.on("connect")
 def ws_connect(auth):
     token = ""
+    session_id = "default"
     if isinstance(auth, dict):
         token = auth.get("token", "")
+        session_id = auth.get("session_id", "default")
     if not EXEC_TOKEN or token != EXEC_TOKEN:
         print(f"[ws] 拒绝未授权连接: {request.sid}", flush=True)
         return False
     try:
-        pid, fd = pty.fork()
-        if pid == 0:
-            os.environ["TERM"] = "xterm-256color"
-            os.execvp("/bin/bash", ["bash", "--login"])
-        active_ptys[request.sid] = (pid, fd)
-        threading.Thread(target=pty_reader, args=(request.sid, pid, fd), daemon=True).start()
-        print(f"[ws] 终端已连接: {request.sid}", flush=True)
+        item = get_or_create_pty(session_id)
+        item["sid"] = request.sid
+        item["connected"] = True
+        item["last_seen"] = time.time()
+        print(f"[ws] 终端连接: session={session_id} sid={request.sid}", flush=True)
     except Exception as e:
-        print(f"[ws] 创建终端失败: {e}", flush=True)
+        print(f"[ws] 连接失败: {e}", flush=True)
         return False
 
 
 @socketio.on("input")
 def ws_input(data):
-    item = active_ptys.get(request.sid)
-    if not item:
-        return
-    pid, fd = item
-    try:
-        payload = data.encode() if isinstance(data, str) else data
-        os.write(fd, payload)
-    except Exception:
-        pass
+    # 按 sid 找到对应 session 并写入 PTY（支持 bytes，避免乱码）
+    for item in active_ptys.values():
+        if item.get("sid") == request.sid:
+            try:
+                payload = data if isinstance(data, bytes) else data.encode()
+                os.write(item["fd"], payload)
+            except Exception:
+                pass
+            break
 
 
 @socketio.on("resize")
 def ws_resize(data):
-    item = active_ptys.get(request.sid)
-    if not item:
-        return
-    pid, fd = item
-    try:
-        rows = int(data.get("rows", 24))
-        cols = int(data.get("cols", 80))
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-    except Exception:
-        pass
+    for item in active_ptys.values():
+        if item.get("sid") == request.sid:
+            try:
+                rows = int(data.get("rows", 24))
+                cols = int(data.get("cols", 80))
+                fcntl.ioctl(item["fd"], termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            except Exception:
+                pass
+            break
 
 
 @socketio.on("disconnect")
 def ws_disconnect():
-    item = active_ptys.pop(request.sid, None)
-    if item:
-        pid, fd = item
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception:
-            pass
-        try:
-            os.close(fd)
-        except Exception:
-            pass
-    print(f"[ws] 终端断开: {request.sid}", flush=True)
-
+    # 断开时保留 PTY（bash 继续跑），等待客户端无痕重连复用
+    for item in active_ptys.values():
+        if item.get("sid") == request.sid:
+            item["connected"] = False
+            item["sid"] = None
+            item["last_seen"] = time.time()
+            print(f"[ws] 客户端断开，保留 PTY 会话（可无痕重连）", flush=True)
+            break
 
 # ==================== 后台备份线程 ====================
 def backup_loop():
