@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作实例：WSS 终端 + API 命令执行 + 文件持久化 + 自动续命"""
+"""工作实例：WSS 终端 + API 命令执行 + 文件持久化 + 自动续命 + 状态上报"""
 import os
 import io
 import json
@@ -8,24 +8,22 @@ import select
 import threading
 import datetime
 import subprocess
+import urllib.request
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 
 import config
 import core
 import terminal
-import tunnels
 
 
 # ==================== 实例初始化 ====================
 def init_instance():
     """读取实例配置，设置专属 asset 名，恢复数据"""
-    # 实例专属 asset（数据隔离，多实例互不干扰）
     config.ASSET_DB = f"inst-{config.INSTANCE_ID}.db.enc"
     config.ASSET_FILES = f"inst-{config.INSTANCE_ID}.files.tar.gz.enc"
     config.ASSET_LEADER = f"leader-{config.INSTANCE_ID}.json"
-    # 读取实例配置（tunnel token 等）
     cfg = core.load_json_enc(f"inst-{config.INSTANCE_ID}.json.enc", default={})
     config.TUNNEL_TOKEN = cfg.get("tunnel_token", config.TUNNEL_TOKEN)
     config.TUNNEL_HOST = cfg.get("hostname", config.TUNNEL_HOST)
@@ -47,17 +45,12 @@ def _elapsed():
     return int((datetime.datetime.now(datetime.timezone.utc) - core.START_TIME).total_seconds())
 
 
-def _elapsed_str(sec):
-    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 # ==================== HTTP 路由 ====================
 @app.route("/")
 def index():
     return jsonify(ok=True, instance=config.INSTANCE_ID, job=core.JOB_ID,
                    elapsed=_elapsed(), leader=leader.is_leader if leader else False,
-                   url=JOB_STATE["last_url"], terminal="wss://" + config.TUNNEL_HOST + "/socket.io")
+                   url=JOB_STATE["last_url"])
 
 
 @app.route("/api/status")
@@ -86,7 +79,7 @@ def api_exec():
     if len(cmd) > 2000:
         return jsonify(ok=False, error="命令过长"), 400
     timeout = int(data.get("timeout", 30))
-    timeout = max(1, min(timeout, 600))  # 1~600 秒
+    timeout = max(1, min(timeout, 600))
     try:
         proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return jsonify(ok=True, code=proc.returncode,
@@ -130,8 +123,8 @@ def _pty_reader(session_key, sid):
                 if data is None:
                     break
                 if data:
-                    sess.feed(data)          # 喂给 pyte 维护干净屏幕
-                    socketio.emit("output", data, to=sid)  # 原始 bytes 传输
+                    sess.feed(data)
+                    socketio.emit("output", data, to=sid)  # 原始 bytes
             else:
                 wpid, status = os.waitpid(sess.pid, os.WNOHANG)
                 if wpid == sess.pid:
@@ -187,7 +180,7 @@ def ws_disconnect():
         terminal.detach_session(session_key)
 
 
-# ==================== 备份/续命/隧道线程 ====================
+# ==================== 后台线程 ====================
 def _backup_loop():
     while True:
         time.sleep(config.BACKUP_INTERVAL)
@@ -207,6 +200,22 @@ def _backup_loop():
             print(f"[backup] 文件备份失败: {e}", flush=True)
 
 
+def _report_running():
+    """启动后向 manager 上报 running 状态"""
+    mgr_host = os.environ.get("MANAGER_HOST", "ghvps.kekeke.cc.cd")
+    try:
+        url = f"https://{mgr_host}/api/instances/{config.INSTANCE_ID}/report"
+        payload = json.dumps({"token": config.EXEC_TOKEN,
+                              "url": f"https://{config.TUNNEL_HOST}"}).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "Mozilla/5.0 (ghvps-worker)"})
+        urllib.request.urlopen(req, timeout=20)
+        print(f"[report] 已向 manager 上报 running", flush=True)
+    except Exception as e:
+        print(f"[report] 上报失败: {e}", flush=True)
+
+
 def _worker_pre_wake():
     """worker 续命：先检查实例是否仍存在（未被关闭）"""
     done = False
@@ -214,7 +223,6 @@ def _worker_pre_wake():
         elapsed = _elapsed()
         if elapsed >= config.PRE_WAKE_SECONDS and not done:
             done = True
-            # 检查实例配置是否还存在（被关闭则删除，不续命）
             cfg = core.load_json_enc(f"inst-{config.INSTANCE_ID}.json.enc", default=None)
             if cfg is None:
                 print(f"[prewake] 实例 {config.INSTANCE_ID} 已关闭，不再续命", flush=True)
@@ -251,13 +259,11 @@ def _start_tunnel():
 # ==================== 入口 ====================
 def run():
     global leader
-    # 实例初始化
     init_cfg = init_instance()
     os.makedirs(config.FILES_DIR, exist_ok=True)
     JOB_STATE["load_status"] = core.load_or_create()
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)
-    # leader 锁
     from core import LeaderLock
     leader = LeaderLock()
     leader.acquire()
@@ -270,6 +276,7 @@ def run():
             threading.Thread(target=_backup_loop, daemon=True).start()
         threading.Thread(target=leader.follower_loop, args=(_on_promote,), daemon=True).start()
     threading.Thread(target=_start_tunnel, daemon=True).start()
+    threading.Thread(target=_report_running, daemon=True).start()
     threading.Thread(target=_worker_pre_wake, daemon=True).start()
     terminal.start_cleanup()
     socketio.run(app, host="0.0.0.0", port=config.PORT, allow_unsafe_werkzeug=True)

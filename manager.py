@@ -7,6 +7,7 @@ import threading
 import subprocess
 import datetime
 import urllib.request
+import urllib.error
 
 from flask import Flask, request, jsonify
 
@@ -91,6 +92,28 @@ def api_close_instance(inst_id):
     return jsonify(res)
 
 
+@app.route("/api/instances/<inst_id>/report", methods=["POST"])
+def api_instance_report(inst_id):
+    """worker 启动后上报状态（由 worker 调用）"""
+    data = request.get_json(silent=True) or {}
+    token = data.get("token", "")
+    if not config.EXEC_TOKEN or token != config.EXEC_TOKEN:
+        return jsonify(ok=False, error="未授权"), 403
+    inst = instances.get_instance(inst_id)
+    if not inst:
+        return jsonify(ok=False, error=f"实例 {inst_id} 不存在"), 404
+    inst["status"] = "running"
+    inst["url"] = data.get("url", inst.get("url"))
+    inst["last_seen"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    all_insts = instances.load_instances()
+    for i in all_insts:
+        if i["id"] == inst_id:
+            i.update(inst)
+            break
+    instances.save_instances(all_insts)
+    return jsonify(ok=True)
+
+
 @app.route("/api/instances/<inst_id>/exec", methods=["POST"])
 def api_instance_exec(inst_id):
     """在指定实例上执行命令（带超时）"""
@@ -114,7 +137,8 @@ def api_instance_exec(inst_id):
     url = f"https://{host}/api/exec"
     try:
         req = urllib.request.Request(url, data=payload,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "Mozilla/5.0 (ghvps-manager)"})
         with urllib.request.urlopen(req, timeout=timeout + 15) as r:
             return jsonify(ok=True, result=json.loads(r.read().decode()))
     except urllib.error.HTTPError as e:
@@ -174,6 +198,5 @@ def run():
         threading.Thread(target=leader.follower_loop, args=(lambda: None,), daemon=True).start()
     threading.Thread(target=_manager_pre_wake, daemon=True).start()
     threading.Thread(target=_start_tunnel, daemon=True).start()
-    # 用 werkzeug 运行（生产可换 gunicorn）
     from werkzeug.serving import run_simple
     run_simple("0.0.0.0", config.PORT, app, threaded=True, use_reloader=False)

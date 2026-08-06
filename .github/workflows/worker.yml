@@ -43,6 +43,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DEMO_KEY: ${{ secrets.DEMO_KEY }}
           EXEC_TOKEN: ${{ secrets.EXEC_TOKEN }}
+          MANAGER_HOST: "ghvps.kekeke.cc.cd"
           PRE_WAKE_SECONDS: "21300"
           WORKER_WORKFLOW: "worker.yml"
         run: python3 app.py
