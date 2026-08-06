@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WSS 交互式终端：PTY + bytes 传输 + pyte + 断线无缝（不杀前台进程）+ 默认 root"""
+"""WSS 交互式终端：PTY + bytes 传输 + pyte + 断线无缝 + 默认root"""
 import os
 import pty
 import time
@@ -25,21 +25,21 @@ class Session:
         self.rows = rows
         self.pid, self.fd = self._spawn()
         self.last_active = time.time()
-        self.attached = True  # 当前是否有客户端连接
-        # pyte 终端模拟：维护干净逻辑屏幕
+        self.attached = True
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
 
     @staticmethod
     def _spawn():
-        """创建 PTY 并启动 root shell（runner 有免密 sudo）"""
+        """创建 PTY 并启动 root 交互 shell（sudo -i，免密）"""
         pid, fd = pty.fork()
         if pid == 0:
             env = os.environ.copy()
             env["LANG"] = "C.UTF-8"
             env["LC_ALL"] = "C.UTF-8"
             env["TERM"] = "xterm-256color"
-            # 默认以 root 运行（sudo -i 进入 root 登录 shell，读 /root/.bashrc）
+            env["GHVPS_PERSIST_DIR"] = config.FILES_DIR
+            # 直接进入 root 登录 shell（sudo 免密）
             os.execvpe("sudo", ["sudo", "-i"], env)
         return pid, fd
 
@@ -77,9 +77,8 @@ class Session:
             pass
 
     def destroy(self):
-        """真正销毁会话（仅超时清理或显式关闭时调用）"""
         try:
-            os.kill(self.pid, signal.SIGHUP)  # 先 SIGHUP 让 bash 优雅退出
+            os.kill(self.pid, signal.SIGHUP)
             time.sleep(0.2)
             os.kill(self.pid, signal.SIGKILL)
         except Exception:
@@ -91,7 +90,6 @@ class Session:
 
 
 def get_or_create_session(session_key: str) -> Session:
-    """根据 session_key 复用已有会话（断线重连），否则新建"""
     with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
@@ -104,7 +102,6 @@ def get_or_create_session(session_key: str) -> Session:
 
 
 def detach_session(session_key: str):
-    """断线时标记会话未连接（不杀进程，保留 bash 和前台进程）"""
     with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
@@ -125,7 +122,6 @@ def get_screen(session_key: str):
 
 
 def cleanup_loop():
-    """清理超过 SESSION_TTL 未重连的会话"""
     while True:
         time.sleep(30)
         now = time.time()

@@ -32,24 +32,12 @@ def init_instance():
 
 # ==================== 系统瘦身（省资源） ====================
 def _system_trim():
-    """
-    停用云环境用不到的服务，节省资源。
-    已实测验证不影响功能：health/exec/WSS/备份全部正常。
-    新实例启动自动执行。
-    """
+    """停用云环境用不到的服务，节省资源。已实测不影响功能。"""
     services = [
-        # PHP（我们用不到）
         "php8.3-fpm", "php8.2-fpm", "php8.1-fpm", "php-fpm",
-        # 云环境用不到的系统服务
-        "ModemManager",       # 调制解调器
-        "multipathd",         # 多路径存储
-        "walinuxagent",       # Azure 管理代理
-        "udisks2",            # 磁盘管理器
-        "getty@tty1",         # 物理登录终端
-        "serial-getty@ttyS0", # 串口登录终端
-        # Docker（GitHub runner 无需，已验证）
+        "ModemManager", "multipathd", "walinuxagent", "udisks2",
+        "getty@tty1", "serial-getty@ttyS0",
         "docker", "containerd", "docker.socket",
-        # snap 包管理（无用）
         "snapd", "snapd.socket", "snapd.seeded", "snapd.apparmor",
         "snapd.core-fixup", "snapd.autoimport", "snapd.system-shutdown",
         "snapd.snap-repair.timer",
@@ -63,39 +51,46 @@ def _system_trim():
     print("[trim] 系统瘦身完成（停用无用服务）", flush=True)
 
 
-# ==================== 终端配置 ====================
+# ==================== 终端配置（默认 root） ====================
 def _write_shell_profile():
-    """生成终端配置：root 用户 + kodebite + 默认进入持久化目录"""
-    persist = config.FILES_DIR  # 绝对路径 /home/runner/files
+    """
+    生成 root 的 .bashrc：默认 root 用户 + PS1 显示 kodebite + 进入持久化目录。
+    终端通过 sudo -i 进入 root，读 /root/.bashrc。
+    """
+    persist = config.FILES_DIR  # /home/runner/files
     os.makedirs(persist, exist_ok=True)
+    # root 的 shell 配置（sudo -i 进入 root 后生效）
+    root_bashrc = f"""# GitHub Actions 云端终端配置（root）
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export TERM=xterm-256color
+export PS1='\\[\\e[32m\\]kodebite@kodebite\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '
+cd {persist} 2>/dev/null || true
+"""
+    # runner 的 shell 配置（备用）
+    runner_bash = f"""# GitHub Actions 云端终端配置（runner）
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export TERM=xterm-256color
+export PS1='\\[\\e[32m\\]kodebite@kodebite\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '
+cd {persist} 2>/dev/null || true
+"""
     try:
-        # runner 用户的 bashrc（供 /api/exec 等使用）
-        home = os.path.expanduser("~")
-        bashrc = f"""# GitHub Actions 云端终端配置
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
-export TERM=xterm-256color
-export PS1='\[\e[32m\]kodebite@kodebite\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
-cd {persist} 2>/dev/null || true
-alias sudo='sudo '
-"""
-        with open(os.path.join(home, ".bashrc"), "w") as f:
-            f.write(bashrc)
-        with open(os.path.join(home, ".bash_profile"), "w") as f:
+        # 写入 root 配置
+        subprocess.run("sudo mkdir -p /root", shell=True, timeout=5)
+        subprocess.run("sudo tee /root/.bashrc > /dev/null", shell=True, timeout=10,
+                       input=root_bashrc.encode())
+        subprocess.run("sudo tee /root/.bash_profile > /dev/null", shell=True, timeout=10,
+                       input=b"source ~/.bashrc 2>/dev/null\n")
+        # 写入 runner 配置
+        with open(os.path.join(os.path.expanduser("~"), ".bashrc"), "w") as f:
+            f.write(runner_bash)
+        with open(os.path.join(os.path.expanduser("~"), ".bash_profile"), "w") as f:
             f.write("source ~/.bashrc 2>/dev/null\n")
-        # root 用户的 bashrc（WSS 终端默认 root 登录时读取）
-        root_bashrc = f"""# root 终端配置
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
-export TERM=xterm-256color
-export PS1='\[\e[31m\]root@kodebite\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]# '
-cd {persist} 2>/dev/null || true
-"""
-        with open("/root/.bashrc", "w") as f:
-            f.write(root_bashrc)
+        # 主机名
         subprocess.run("sudo hostname kodebite 2>/dev/null || hostname kodebite 2>/dev/null",
                        shell=True, timeout=5)
-        print("[shell] 终端配置完成（root + kodebite + 持久化目录）", flush=True)
+        print("[shell] root 终端配置完成（默认root + kodebite + 持久化目录）", flush=True)
     except Exception as e:
         print(f"[shell] 配置写入失败: {e}", flush=True)
 
@@ -219,7 +214,6 @@ def _pty_reader(session_key, sid):
                     break
     except Exception:
         pass
-    # 断开时不关闭 fd、不杀进程，bash 继续存活，重连复用
 
 
 @socketio.on("connect")
@@ -349,7 +343,6 @@ def run():
     os.makedirs(config.FILES_DIR, exist_ok=True)
     JOB_STATE["load_status"] = core.load_or_create()
     _write_shell_profile()
-    # 系统瘦身 + 用户 setup（后台执行，不阻塞启动）
     threading.Thread(target=_system_trim, daemon=True).start()
     _run_setup()
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
