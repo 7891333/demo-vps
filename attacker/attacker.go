@@ -51,7 +51,7 @@ type mmsghdr struct {
 }
 
 func sendmmsgCall(fd int, msgvec *mmsghdr, vlen uint32) (uint32, error) {
-	r1, _, errno := syscall.Syscall6(syscall.SYS_SENDMMSG, uintptr(fd),
+	r1, _, errno := syscall.Syscall6(SYS_SENDMMSG, uintptr(fd),
 		uintptr(unsafe.Pointer(msgvec)), uintptr(vlen), 0, 0, 0)
 	if errno != 0 {
 		return uint32(r1), errno
