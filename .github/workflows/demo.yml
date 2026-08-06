@@ -40,5 +40,7 @@ jobs:
           TUNNEL_HOST: "ghvps.kekeke.cc.cd"
           BACKUP_INTERVAL: "45"
           PRE_WAKE_SECONDS: "21000"
+          HEARTBEAT_INTERVAL: "30"
+          HEARTBEAT_TIMEOUT: "90"
         run: |
           python3 demo_server.py

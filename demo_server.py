@@ -12,6 +12,8 @@ GitHub Actions 临时环境加密持久化演示站点核心脚本
 - Flask 演示站点（留言板，验证跨 job 持久化）
 - Cloudflare 固定隧道（自定义域名 ghvps.kekeke.cc.cd），URL 自动上报仓库
 - 无缝衔接：job 到期前预触发下一个 job（PRE_WAKE_SECONDS），可用率 99.9%
+- 【主job锁】杜绝数据分叉：多 job 并行时仅 leader 写库+备份，follower 只读。
+  用 Releases 里的 leader.json 心跳文件作分布式锁，leader 心跳过期后 follower 自动升级接管。
 - 远程控制接口 /api/exec（带 EXEC_TOKEN 认证），可实时执行 shell 命令
 """
 import os
@@ -36,9 +38,12 @@ DEMO_KEY = os.environ.get("DEMO_KEY", "")
 EXEC_TOKEN = os.environ.get("EXEC_TOKEN", "")
 TUNNEL_TOKEN = os.environ.get("TUNNEL_TOKEN", "")  # Cloudflare 固定隧道凭证
 TUNNEL_HOST = os.environ.get("TUNNEL_HOST", "ghvps.kekeke.cc.cd")  # 固定域名
-PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))  # 到期前预唤醒（默认21000s=5h50m）
+PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))  # 到期前预唤醒（21000s=5h50m）
 BACKUP_TAG = "backup"
 ASSET_NAME = "demo.db.enc"
+LEADER_ASSET = "leader.json"  # 分布式锁心跳文件
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))  # 心跳间隔
+HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "90"))  # 心跳过期判定
 DB_FILE = "demo.db"
 PORT = int(os.environ.get("PORT", "8080"))
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))  # 秒
@@ -48,6 +53,7 @@ START_TIME = datetime.datetime.now(datetime.timezone.utc)
 LAST_URL = ""
 LOAD_STATUS = "初始化中"
 PRE_WAKE_DONE = False  # 防止重复预触发
+IS_LEADER = False  # 是否为主 job（负责写库+备份）
 
 # ==================== 加密工具 ====================
 def encrypt_file(data: bytes, key_hex: str) -> bytes:
@@ -120,28 +126,53 @@ def ensure_release():
     raise RuntimeError(f"创建 release 失败: {status} {d}")
 
 
-def load_or_create():
-    """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
-    global LOAD_STATUS
+def delete_asset(name):
+    """删除 release 中指定名称的 asset"""
     rel = get_release()
     if rel:
         for a in rel.get("assets", []):
-            if a.get("name") == ASSET_NAME:
-                # 关键：下载 asset 必须带 Accept: application/octet-stream，否则返回 JSON
-                status, blob = gh_request(
-                    "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}",
-                    raw=True, headers={"Accept": "application/octet-stream"},
-                )
-                if status == 200:
-                    try:
-                        data = decrypt_file(blob, DEMO_KEY)
-                        with open(DB_FILE, "wb") as f:
-                            f.write(data)
-                        LOAD_STATUS = f"从 Releases 恢复加密备份（{len(data)} 字节）"
-                        print(f"[load] {LOAD_STATUS}", flush=True)
-                        return
-                    except Exception as e:
-                        print(f"[load] 解密失败，改用新库: {e}", flush=True)
+            if a.get("name") == name:
+                gh_request("DELETE", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}")
+
+
+def upload_asset(name, data_bytes):
+    """上传/覆盖 asset，返回 (大小, HTTP状态)。必须用 uploads.github.com 域名"""
+    rel_id = ensure_release()
+    delete_asset(name)
+    url = f"https://uploads.github.com/repos/{REPO}/releases/{rel_id}/assets?name={name}"
+    status, resp = gh_request("POST", url, data=data_bytes, headers={"Content-Type": "application/octet-stream"})
+    return len(data_bytes), status
+
+
+def download_asset(name):
+    """下载 asset 内容，不存在返回 None。必须带 Accept: application/octet-stream 头"""
+    rel = get_release()
+    if not rel:
+        return None
+    for a in rel.get("assets", []):
+        if a.get("name") == name:
+            status, blob = gh_request(
+                "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}",
+                raw=True, headers={"Accept": "application/octet-stream"},
+            )
+            return blob if status == 200 else None
+    return None
+
+
+def load_or_create():
+    """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
+    global LOAD_STATUS
+    blob = download_asset(ASSET_NAME)
+    if blob:
+        try:
+            data = decrypt_file(blob, DEMO_KEY)
+            with open(DB_FILE, "wb") as f:
+                f.write(data)
+            LOAD_STATUS = f"从 Releases 恢复加密备份（{len(data)} 字节）"
+            print(f"[load] {LOAD_STATUS}", flush=True)
+            return
+        except Exception as e:
+            print(f"[load] 解密失败，改用新库: {e}", flush=True)
     create_new_db()
     LOAD_STATUS = "新建初始数据库"
     print(f"[load] {LOAD_STATUS}", flush=True)
@@ -168,18 +199,79 @@ def backup_database():
     with open(DB_FILE, "rb") as f:
         data = f.read()
     enc = encrypt_file(data, DEMO_KEY)
-    rel_id = ensure_release()
-    rel = get_release()
-    if rel:
-        for a in rel.get("assets", []):
-            if a.get("name") == ASSET_NAME:
-                gh_request("DELETE", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}")
-    # 关键：上传 asset 必须用 uploads.github.com 域名，用 api.github.com 会 404
-    url = f"https://uploads.github.com/repos/{REPO}/releases/{rel_id}/assets?name={ASSET_NAME}"
-    status, resp = gh_request("POST", url, data=enc, headers={"Content-Type": "application/octet-stream"})
-    return len(enc), status
+    return upload_asset(ASSET_NAME, enc)
 
 
+# ==================== 主 job 锁（杜绝数据分叉） ====================
+def get_leader():
+    """读取 leader.json 心跳，返回 dict 或 None"""
+    blob = download_asset(LEADER_ASSET)
+    if not blob:
+        return None
+    try:
+        return json.loads(blob.decode())
+    except Exception:
+        return None
+
+
+def set_leader_heartbeat():
+    """更新 leader 心跳到 Releases"""
+    data = json.dumps({"job_id": JOB_ID, "heartbeat": time.time()}).encode()
+    upload_asset(LEADER_ASSET, data)
+
+
+def acquire_leader():
+    """尝试成为 leader，成功返回 True"""
+    global IS_LEADER
+    leader = get_leader()
+    now = time.time()
+    if leader and leader.get("job_id") != JOB_ID and (now - leader.get("heartbeat", 0)) < HEARTBEAT_TIMEOUT:
+        IS_LEADER = False
+        print(f"[leader] 已有活跃 leader: {leader.get('job_id')}，本 job 为 follower（只读）", flush=True)
+        return False
+    IS_LEADER = True
+    set_leader_heartbeat()
+    print(f"[leader] 本 job 成为 leader: {JOB_ID}", flush=True)
+    return True
+
+
+def leader_loop():
+    """leader 心跳线程：定期刷新心跳，保持锁"""
+    while True:
+        if not IS_LEADER:
+            return
+        time.sleep(HEARTBEAT_INTERVAL)
+        try:
+            set_leader_heartbeat()
+        except Exception as e:
+            print(f"[leader] 心跳失败: {e}", flush=True)
+
+
+def follower_loop():
+    """follower 线程：检测 leader 心跳过期后升级为 leader 接管"""
+    global IS_LEADER
+    while True:
+        if IS_LEADER:
+            return
+        time.sleep(HEARTBEAT_INTERVAL)
+        try:
+            leader = get_leader()
+            now = time.time()
+            if not leader or (now - leader.get("heartbeat", 0)) >= HEARTBEAT_TIMEOUT:
+                if acquire_leader():
+                    # 升级为 leader，重新拉取最新备份并启动备份线程
+                    try:
+                        load_or_create()
+                        print("[leader] 升级后已重新拉取最新备份", flush=True)
+                    except Exception as e:
+                        print(f"[leader] 升级后重拉失败: {e}", flush=True)
+                    threading.Thread(target=backup_loop, daemon=True).start()
+                    return
+        except Exception as e:
+            print(f"[follower] 检查失败: {e}", flush=True)
+
+
+# ==================== 公网 URL 上报 ====================
 def report_url(url):
     """把公网 URL 写到仓库的 public_url.txt，方便随时查询"""
     global LAST_URL
@@ -203,7 +295,6 @@ def start_tunnel():
     """启动隧道：优先 Cloudflare 固定隧道（自定义域名），回退 quick tunnel"""
     try:
         if TUNNEL_TOKEN:
-            # 固定隧道：用 token 启动，绑定自定义域名
             proc = subprocess.Popen(
                 ["cloudflared", "tunnel", "--no-autoupdate", "run", "--token", TUNNEL_TOKEN],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -211,7 +302,6 @@ def start_tunnel():
             url = f"https://{TUNNEL_HOST}"
             print(f"[tunnel] 固定隧道启动: {url}", flush=True)
             report_url(url)
-            # 持续读取输出，防止管道阻塞，同时监控连接状态
             for line in proc.stdout:
                 line = line.strip()
                 if "Registered tunnel connection" in line:
@@ -219,7 +309,6 @@ def start_tunnel():
                 elif "ERR" in line.upper() and "error" in line.lower():
                     print(f"[tunnel] 异常: {line}", flush=True)
         else:
-            # 回退：quick tunnel（随机域名）
             proc = subprocess.Popen(
                 ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -284,6 +373,7 @@ header h1{font-size:22px;font-weight:600;letter-spacing:0.5px;color:#fff}
 header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 .badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:11px;font-weight:500;letter-spacing:0.3px;border:1px solid #333}
 .badge.green{color:#7ee787;border-color:#2a5e2a}
+.badge.amber{color:#ffab00;border-color:#5a4a00}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
 .card{background:#1e1e1e;border:1px solid #2a2a2a;border-radius:6px;padding:18px}
 .card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
@@ -304,6 +394,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 .form button{background:#fff;color:#0a0a0a;border:none;border-radius:4px;padding:10px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
 .form button:hover{opacity:.85}
 .form button:active{transform:scale(.97)}
+.form button:disabled{opacity:.4;cursor:not-allowed}
 .foot{text-align:center;color:#555;font-size:11px;padding-top:20px;border-top:1px solid #1a1a1a}
 .foot .mono{font-family:Consolas,monospace}
 .enc{display:inline-flex;align-items:center;gap:6px;color:#7ee787;font-size:12px}
@@ -317,7 +408,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 <body>
 <div class="wrap">
 <header>
-  <span class="badge green">AES-256-GCM 加密持久化</span>
+  <span class="badge {{ 'green' if is_leader else 'orange' }}">{{ 'LEADER 主节点' if is_leader else 'FOLLOWER 备份节点' }}</span>
   <h1>GitHub Actions 临时环境演示</h1>
   <p>利用 GitHub Actions 定时唤醒 + Releases 永久存储，实现无需本地守护进程的自动续传与数据加密持久化。</p>
 </header>
@@ -347,7 +438,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 
 <div class="section">
   <h2><span class="dot"></span>留言板（数据持久化验证）</h2>
-  <p style="font-size:12px;color:#888;margin-bottom:12px">在这里添加留言，数据会被 AES 加密后上传到 GitHub Releases，即使 job 销毁，下次唤醒也会自动恢复。</p>
+  <p style="font-size:12px;color:#888;margin-bottom:12px">在这里添加留言，数据会被 AES 加密后上传到 GitHub Releases，即使 job 销毁，下次唤醒也会自动恢复。{{ '主节点可写入' if is_leader else '当前为备份节点（只读），leader 切换后恢复写入' }}</p>
   <ul class="list" id="msglist">
     {% for m in messages %}
     <li><span class="t">{{ m.content }}</span><span class="d">{{ m.created_at }}</span></li>
@@ -356,8 +447,8 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
     {% endfor %}
   </ul>
   <div class="form">
-    <input id="content" placeholder="输入留言内容..." maxlength="200">
-    <button onclick="addMsg()">添加</button>
+    <input id="content" placeholder="输入留言内容..." maxlength="200" {{ '' if is_leader else 'disabled' }}>
+    <button onclick="addMsg()" {{ '' if is_leader else 'disabled' }}>添加</button>
   </div>
 </div>
 
@@ -368,7 +459,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
     <li><span class="t">密钥存储</span><span class="d">GitHub Secrets（不落盘）</span></li>
     <li><span class="t">备份位置</span><span class="d">GitHub Releases</span></li>
     <li><span class="t">自动备份间隔</span><span class="d">{{ backup_interval }} 秒</span></li>
-    <li><span class="t">job 生命周期</span><span class="d">~6 小时 · 无缝衔接</span></li>
+    <li><span class="t">job 生命周期</span><span class="d">~6 小时 · 无缝衔接 · 主job锁</span></li>
   </ul>
 </div>
 
@@ -409,11 +500,14 @@ def index():
     return render_template_string(
         HTML, job_id=JOB_ID, elapsed=elapsed_str(elapsed_seconds()), visits=v,
         data_source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL,
+        is_leader=IS_LEADER,
     )
 
 
 @app.route("/api/add", methods=["POST"])
 def add_msg():
+    if not IS_LEADER:
+        return jsonify(ok=False, error="当前为备份节点（只读），leader 切换后自动恢复写入"), 503
     data = request.get_json(silent=True) or {}
     content = (data.get("content") or "").strip()
     if not content:
@@ -432,6 +526,8 @@ def add_msg():
 
 @app.route("/api/backup", methods=["POST"])
 def manual_backup():
+    if not IS_LEADER:
+        return jsonify(ok=False, error="当前为备份节点，不执行备份"), 503
     try:
         size, status = backup_database()
         return jsonify(ok=True, size=size, status=status)
@@ -441,13 +537,13 @@ def manual_backup():
 
 @app.route("/api/health")
 def health():
-    return jsonify(ok=True, job_id=JOB_ID, elapsed=elapsed_seconds())
+    return jsonify(ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(), leader=IS_LEADER)
 
 
 @app.route("/api/status")
 def api_status():
     return jsonify(
-        ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(),
+        ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(), leader=IS_LEADER,
         url=LAST_URL, source=LOAD_STATUS, backup_interval=BACKUP_INTERVAL,
         tunnel_host=TUNNEL_HOST, pre_wake=PRE_WAKE_SECONDS,
     )
@@ -481,6 +577,8 @@ def exec_cmd():
 def backup_loop():
     while True:
         time.sleep(BACKUP_INTERVAL)
+        if not IS_LEADER:
+            return
         try:
             size, status = backup_database()
             print(f"[backup] 已加密上传 {size} 字节 (HTTP {status})", flush=True)
@@ -520,7 +618,13 @@ if __name__ == "__main__":
     if not TUNNEL_TOKEN:
         print("[warn] TUNNEL_TOKEN 未设置，回退 quick tunnel", flush=True)
     load_or_create()
-    threading.Thread(target=backup_loop, daemon=True).start()
+    # 抢锁：决定本 job 是 leader（写+备份）还是 follower（只读）
+    acquire_leader()
+    if IS_LEADER:
+        threading.Thread(target=backup_loop, daemon=True).start()
+        threading.Thread(target=leader_loop, daemon=True).start()
+    else:
+        threading.Thread(target=follower_loop, daemon=True).start()
     threading.Thread(target=start_tunnel, daemon=True).start()
     threading.Thread(target=pre_wake_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
