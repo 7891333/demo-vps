@@ -47,7 +47,8 @@ SESSION = _load_session()
 # ==================== HTTP API ====================
 def api(method, url, data=None, timeout=30):
     """请求 manager API，返回 dict"""
-    h = {"Content-Type": "application/json"}
+    h = {"Content-Type": "application/json",
+         "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"}
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, method=method, headers=h, data=body)
     try:
@@ -69,7 +70,8 @@ def mgr(path):
 # ==================== 终端连接 ====================
 def _get_clean_screen(url):
     try:
-        req = urllib.request.Request(url.rstrip("/") + f"/api/term/screen?session={SESSION}")
+        req = urllib.request.Request(url.rstrip("/") + f"/api/term/screen?session={SESSION}",
+                                      headers={"User-Agent": "Mozilla/5.0 (ghvss-cli)"})
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read().decode())
             if d.get("ok"):
