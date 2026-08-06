@@ -5,11 +5,12 @@ GitHub Actions 云端交互式终端客户端（类 SSH）
 
 特性：
 - 交互式 bash 终端（PTY），支持 vi/top 等全屏程序
-- 自动重连：断线后指数退避自动重连，保持同一会话（bash 历史、运行中命令不丢）
-- 会话持久化：session_key 存本地，重连复用同一 PTY
+- bytes 传输（修复中文乱码）
+- 自动重连 + 会话保持（断线后 bash 历史/运行中命令不丢）
+- 复制干净屏幕：连接后按 Ctrl+O 获取干净屏幕文本
 
 用法：
-  python3 ghvss_cli.py <EXEC_TOKEN>
+  python3 ghvss_cli.py <EXEC_TOKEN> [URL]
   EXEC_TOKEN=xxx python3 ghvss_cli.py
 """
 import os
@@ -21,6 +22,7 @@ import struct
 import fcntl
 import termios
 import threading
+import urllib.request
 
 import socketio
 
@@ -30,7 +32,6 @@ SESSION_FILE = os.path.expanduser("~/.ghvps_session")
 
 
 def _load_session():
-    """读取或创建持久化 session_key（保证重连复用同一会话）"""
     if os.path.exists(SESSION_FILE):
         with open(SESSION_FILE) as f:
             k = f.read().strip()
@@ -44,7 +45,6 @@ def _load_session():
 
 SESSION = _load_session()
 
-# 自动重连：reconnection_attempts=0 表示无限重连，指数退避
 sio = socketio.Client(
     reconnection=True,
     reconnection_attempts=0,
@@ -54,9 +54,27 @@ sio = socketio.Client(
 )
 
 
+def _get_clean_screen():
+    """从服务端获取 pyte 干净屏幕文本"""
+    try:
+        url = f"{URL}/api/term/screen?session={SESSION}"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+            if data.get("ok"):
+                return data.get("screen", "")
+    except Exception:
+        pass
+    return ""
+
+
 @sio.on("output")
 def on_output(data):
-    sys.stdout.write(data)
+    # bytes 直接写，避免乱码
+    if isinstance(data, bytes):
+        sys.stdout.buffer.write(data)
+    else:
+        sys.stdout.write(data)
     sys.stdout.flush()
 
 
@@ -67,7 +85,6 @@ def on_exit(data):
 
 @sio.event
 def connect():
-    # 连接后发送当前终端窗口大小
     try:
         rows, cols = struct.unpack(
             "HHHH", fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0\0\0\0\0\0\0\0")
@@ -75,7 +92,7 @@ def connect():
         sio.emit("resize", {"rows": rows, "cols": cols})
     except Exception:
         pass
-    sys.stderr.write("\r\n[已连接云端终端] 断线自动重连，会话保持\r\n")
+    sys.stderr.write("\r\n[已连接云端终端] Ctrl+O 复制干净屏幕 · 断线自动重连\r\n")
     sys.stderr.flush()
 
 
@@ -86,13 +103,19 @@ def disconnect():
 
 
 def _send_loop():
-    """读取本地 stdin 逐字节发送"""
     try:
         while True:
-            ch = os.read(0, 1)
+            ch = os.read(0, 1)  # bytes
             if not ch:
                 break
-            sio.emit("input", ch.decode(errors="replace"))
+            # Ctrl+O (0x0f) 获取干净屏幕
+            if ch == b"\x0f":
+                screen = _get_clean_screen()
+                if screen:
+                    sys.stdout.write("\r\n" + screen + "\r\n")
+                    sys.stdout.flush()
+                continue
+            sio.emit("input", ch)  # 直接发 bytes
     except Exception:
         pass
     finally:
@@ -103,11 +126,14 @@ def _send_loop():
 
 
 def main():
-    global TOKEN
+    global TOKEN, URL, API
     if len(sys.argv) > 1:
         TOKEN = sys.argv[1]
+    if len(sys.argv) > 2:
+        URL = sys.argv[2].rstrip("/")
+    API = URL
     if not TOKEN:
-        print("用法: python3 ghvss_cli.py <EXEC_TOKEN>", file=sys.stderr)
+        print("用法: python3 ghvss_cli.py <EXEC_TOKEN> [URL]", file=sys.stderr)
         sys.exit(1)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -124,4 +150,5 @@ def main():
 
 
 if __name__ == "__main__":
+    import json
     main()

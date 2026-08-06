@@ -1,0 +1,48 @@
+name: manager
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时自动唤醒，自动续命
+    - cron: '0 */6 * * *'
+
+jobs:
+  manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -sL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cf.deb || sudo apt-get install -y -f
+
+      - name: Run manager
+        env:
+          INSTANCE_ROLE: manager
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEMO_KEY: ${{ secrets.DEMO_KEY }}
+          EXEC_TOKEN: ${{ secrets.EXEC_TOKEN }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          TUNNEL_HOST: "ghvps.kekeke.cc.cd"
+          CF_EMAIL: ${{ secrets.CF_EMAIL }}
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          BASE_DOMAIN: "kekeke.cc.cd"
+          TUNNEL_PREFIX: "ghvps"
+          MANAGER_WORKFLOW: "manager.yml"
+          WORKER_WORKFLOW: "worker.yml"
+          PRE_WAKE_SECONDS: "21300"
+        run: python3 app.py

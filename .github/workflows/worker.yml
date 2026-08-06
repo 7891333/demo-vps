@@ -1,0 +1,42 @@
+name: worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      INSTANCE_ID:
+        description: '工作实例 ID（由管理实例分配）'
+        required: true
+        type: string
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -sL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cf.deb || sudo apt-get install -y -f
+
+      - name: Run worker
+        env:
+          INSTANCE_ROLE: worker
+          INSTANCE_ID: ${{ github.event.inputs.INSTANCE_ID }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEMO_KEY: ${{ secrets.DEMO_KEY }}
+          EXEC_TOKEN: ${{ secrets.EXEC_TOKEN }}
+          PRE_WAKE_SECONDS: "21300"
+          WORKER_WORKFLOW: "worker.yml"
+        run: python3 app.py

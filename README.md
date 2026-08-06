@@ -1,62 +1,91 @@
-# GitHub Actions 临时环境加密持久化演示
+# GitHub Actions 多实例管理器
 
-利用 **GitHub Actions 的 schedule 定时唤醒** + **GitHub Releases 永久存储**，
-实现**无需本地守护进程**的云端自动续命与数据加密持久化。
+利用 **GitHub Actions 临时环境** + **GitHub Releases 加密存储**，实现：
+- **一键创建多个云端工作实例**（纯 API）
+- **多 GitHub 账号支持**（一个账号 20 并发，N 个账号 = N×20）
+- 每个实例：WSS 交互式终端 + API 命令执行 + 文件持久化 + 自动续命
+- 生产级模块化架构
 
-## 核心思路
+## 架构
 
 ```
-GitHub Actions 每 6 小时自动醒来（schedule cron 触发，不需要本地守护进程）
-  ├─ ① 从 GitHub Releases 拉取 AES-256-GCM 加密备份
-  ├─ ② 用 GitHub Secrets 中的密钥解密，打开数据库
-  ├─ ③ 运行演示站点（本 job 生命周期内）
-  ├─ ④ 后台线程每 45 秒把数据库加密后上传回 Releases
-  └─ ⑤ 6 小时到点销毁，数据已安全存在 Releases
-        ↓
-  下个 schedule 自动醒来，重复 ①→⑤
+【管理实例 manager】总管家（固定域名 ghvps.kekeke.cc.cd）
+  ├─ 账号池管理（多账号 + 自动负载均衡 + 并发检测）
+  ├─ 实例创建/关闭/查询 API
+  └─ 自动续命（每6小时无缝衔接）
+
+【工作实例 worker × N】（instN.ghvps.kekeke.cc.cd）
+  ├─ WSS 交互式终端（bytes 传输无乱码 + pyte 干净屏幕）
+  ├─ API 命令执行（带超时）
+  ├─ 文件持久化（~/files 目录）
+  └─ 自动续命（除非手动关闭）
 ```
 
-## 为什么安全
+## 快速开始
 
-- **public 仓库免费无限跑**（private 有分钟配额限制）
-- 数据库在 Releases 中是 **AES-256-GCM 加密后的密文**，公开也无妨
-- 密钥只存在 **GitHub Secrets**，GitHub 加密保管，永不落盘/入库
-- 仓库被扒走 = 一堆密文，没有密钥毫无价值
-
-## 文件说明
-
-| 文件 | 作用 |
-|------|------|
-| `demo_server.py` | 云端核心：拉取/解密/启动站点/定期加密备份/挂隧道/远程控制 |
-| `.github/workflows/demo.yml` | workflow：定时唤醒 + 环境 + 运行 |
-| `requirements.txt` | Python 依赖 |
-
-## 所需 Secrets
-
+### 1. 配置 Secrets（管理仓库）
 | Secret | 说明 |
 |--------|------|
-| `DEMO_KEY` | AES-256 加密密钥（hex，64位） |
-| `GH_TOKEN` | 有 repo 权限的 GitHub Token |
-| `EXEC_TOKEN` | 远程控制接口 `/api/exec` 的认证令牌 |
+| `GH_TOKEN` | 管理账号 GitHub Token |
+| `DEMO_KEY` | AES-256 加密密钥（hex 64位） |
+| `EXEC_TOKEN` | 远程控制/终端令牌 |
+| `TUNNEL_TOKEN` | Manager 固定隧道凭证 |
+| `CF_EMAIL` / `CF_API_KEY` | Cloudflare 账号 |
+| `CF_ACCOUNT_ID` / `CF_ZONE_ID` | Cloudflare 区域 |
 
-## 远程控制接口
+### 2. 触发管理实例
+```bash
+gh workflow run manager.yml --repo <owner>/demo-vps
+```
 
-云端服务通过 Cloudflare quick tunnel 暴露公网，启动后公网 URL 会自动
-写入仓库根目录的 `public_url.txt`（每次唤醒更新）。
+### 3. 添加工作账号
+```bash
+curl -X POST https://ghvps.kekeke.cc.cd/api/accounts \
+  -H "Content-Type: application/json" \
+  -d '{"name":"acc1","token":"ghp_xxx","repo":"<owner>/demo-vps","max_concurrency":20}'
+```
+
+### 4. 一键创建实例
+```bash
+curl -X POST https://ghvps.kekeke.cc.cd/api/instances
+# → {"ok":true,"instance":{"id":"inst1","hostname":"inst1.ghvps.kekeke.cc.cd",...}}
+```
+
+### 5. 连接终端
+```bash
+python3 ghvss_cli.py <EXEC_TOKEN> https://inst1.ghvps.kekeke.cc.cd
+```
+
+## 管理 API
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/api/exec` | POST | 远程执行 shell 命令（需 `{"token": EXEC_TOKEN, "cmd": "..."}`） |
-| `/api/status` | GET | 查询运行状态、URL、数据来源 |
-| `/api/health` | GET | 健康检查 |
-| `/api/backup` | POST | 手动立即加密备份 |
+| `/api/status` | GET | 查看账号和实例总览 |
+| `/api/accounts` | GET/POST | 查看/添加账号 |
+| `/api/accounts/<name>` | DELETE | 删除账号 |
+| `/api/instances` | POST/GET | 创建/查看实例 |
+| `/api/instances/<id>` | GET/DELETE | 查看/关闭实例 |
+| `/api/instances/<id>/exec` | POST | 在实例上执行命令（带超时） |
 
-## 手动触发
+## 工作实例 API
 
-```bash
-# 手动触发一次
-curl -X POST https://api.github.com/repos/7891333/demo-vps/actions/workflows/demo.yml/dispatches \
-  -H "Authorization: token <GH_TOKEN>" \
-  -H "Accept: application/vnd.github.v3+json" \
-  -d '{"ref":"main"}'
-```
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/exec` | POST | 命令执行（token + timeout） |
+| `/api/term/screen` | GET | pyte 干净屏幕文本 |
+| `/api/backup` | POST | 手动备份 |
+| `/api/status` | GET | 实例状态 |
+| `/socket.io` | WSS | 交互式终端 |
+
+## 多账号并发
+
+- 每个账号最大并发 = `max_concurrency`（默认 20）
+- 创建实例时自动负载均衡（选余量最多的账号）
+- 全部账号满时返回"并发已满"错误
+- 动态添加账号：`POST /api/accounts`
+
+## 持久化
+
+- 数据库 + `~/files/` 文件目录，每 45 秒加密备份到 Releases
+- 每个实例数据独立（按实例 ID 隔离 asset）
+- job 销毁自动恢复，除非手动关闭实例

@@ -2,3 +2,5 @@ flask>=3.0
 flask-socketio>=5.3
 simple-websocket>=1.0
 pycryptodome>=3.20
+pyte>=0.8.2
+requests>=2.31

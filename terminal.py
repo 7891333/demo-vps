@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""WSS 交互式终端会话管理：PTY 伪终端 + 断线重连保持会话 + UTF-8 修复"""
+"""WSS 交互式终端：PTY + bytes 传输（修复乱码）+ pyte 终端模拟（干净文本）"""
 import os
 import pty
 import time
@@ -9,27 +9,31 @@ import struct
 import termios
 import threading
 
+import pyte
+
 import config
 
 # 会话表: session_key -> Session
 SESSIONS = {}
-_sessions_lock = threading.Lock()
+_lock = threading.Lock()
 
 
 class Session:
-    """一个终端会话（对应一个 PTY/bash 进程）"""
-
-    def __init__(self, key):
+    def __init__(self, key, cols=100, rows=30):
         self.key = key
+        self.cols = cols
+        self.rows = rows
         self.pid, self.fd = self._spawn()
-        self.last_active = time.time()  # 最近活跃时间
-        self.attached = True  # 当前是否有客户端连接
+        self.last_active = time.time()
+        self.attached = True
+        # pyte 终端模拟：维护干净逻辑屏幕（供复制/导出）
+        self.screen = pyte.Screen(cols, rows)
+        self.stream = pyte.Stream(self.screen)
 
     @staticmethod
     def _spawn():
-        """创建 PTY 并启动 bash（UTF-8 locale，修复中文乱码）"""
         pid, fd = pty.fork()
-        if pid == 0:  # 子进程
+        if pid == 0:
             env = os.environ.copy()
             env["LANG"] = "C.UTF-8"
             env["LC_ALL"] = "C.UTF-8"
@@ -37,30 +41,42 @@ class Session:
             os.execvpe("/bin/bash", ["bash", "--login"], env)
         return pid, fd
 
-    def read_output(self, chunk=4096):
-        """读取 PTY 输出，返回字节串"""
+    def feed(self, data: bytes):
+        """把 PTY 输出喂给 pyte（维护干净屏幕），不影响原始 bytes 传输"""
         try:
-            data = os.read(self.fd, chunk)
-            return data
+            self.stream.feed(data.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    def get_screen(self):
+        """返回当前逻辑屏幕的干净文本（用于复制/导出）"""
+        try:
+            return "\n".join(self.screen.display)
+        except Exception:
+            return ""
+
+    def read_output(self, chunk=4096):
+        try:
+            return os.read(self.fd, chunk)
         except OSError:
             return None
 
     def write_input(self, data: bytes):
-        """写入客户端输入到 PTY"""
         try:
             os.write(self.fd, data)
             self.last_active = time.time()
         except OSError:
             pass
 
-    def resize(self, rows: int, cols: int):
+    def resize(self, rows, cols):
         try:
+            self.rows, self.cols = rows, cols
             fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            self.screen.resize(rows, cols)
         except Exception:
             pass
 
     def destroy(self):
-        """销毁会话"""
         try:
             os.kill(self.pid, signal.SIGKILL)
         except Exception:
@@ -72,8 +88,7 @@ class Session:
 
 
 def get_or_create_session(session_key: str) -> Session:
-    """根据 session_key 获取已有会话（断线重连复用），否则新建"""
-    with _sessions_lock:
+    with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
             sess.attached = True
@@ -85,8 +100,7 @@ def get_or_create_session(session_key: str) -> Session:
 
 
 def detach_session(session_key: str):
-    """客户端断开时标记会话为未连接（保留 SESSION_TTL 等待重连）"""
-    with _sessions_lock:
+    with _lock:
         sess = SESSIONS.get(session_key)
         if sess:
             sess.attached = False
@@ -94,24 +108,26 @@ def detach_session(session_key: str):
 
 
 def destroy_session(session_key: str):
-    """销毁指定会话"""
-    with _sessions_lock:
+    with _lock:
         sess = SESSIONS.pop(session_key, None)
     if sess:
         sess.destroy()
 
 
+def get_screen(session_key: str):
+    sess = SESSIONS.get(session_key)
+    return sess.get_screen() if sess else ""
+
+
 def cleanup_loop():
-    """清理过期会话（超过 SESSION_TTL 未重连的）"""
     while True:
         time.sleep(30)
         now = time.time()
-        with _sessions_lock:
+        with _lock:
             stale = [k for k, s in SESSIONS.items()
-                     if not getattr(s, "attached", True) and (now - s.last_active) > config.SESSION_TTL]
+                     if not s.attached and (now - s.last_active) > config.SESSION_TTL]
             for k in stale:
-                s = SESSIONS.pop(k)
-                s.destroy()
+                SESSIONS.pop(k).destroy()
                 print(f"[session] 会话过期已清理: {k}", flush=True)
 
 
