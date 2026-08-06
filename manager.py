@@ -123,6 +123,26 @@ def api_instance_exec(inst_id):
         return jsonify(ok=False, error=f"无法连接实例: {e}"), 502
 
 
+# ==================== 隧道 ====================
+def _start_tunnel():
+    """启动管理实例固定隧道（ghvps.kekeke.cc.cd）"""
+    if not config.TUNNEL_TOKEN:
+        print("[tunnel] 无 TUNNEL_TOKEN，跳过", flush=True)
+        return
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--no-autoupdate", "run", "--token", config.TUNNEL_TOKEN],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        url = f"https://{config.TUNNEL_HOST}"
+        print(f"[tunnel] 管理实例隧道: {url}", flush=True)
+        for line in proc.stdout:
+            line = line.strip()
+            if "Registered tunnel connection" in line:
+                print("[tunnel] 连接已注册", flush=True)
+    except Exception as e:
+        print(f"[tunnel] 启动失败: {e}", flush=True)
+
+
 # ==================== 续命 ====================
 def _manager_pre_wake():
     done = False
@@ -152,6 +172,7 @@ def run():
     else:
         threading.Thread(target=leader.follower_loop, args=(lambda: None,), daemon=True).start()
     threading.Thread(target=_manager_pre_wake, daemon=True).start()
+    threading.Thread(target=_start_tunnel, daemon=True).start()
     # 用 werkzeug 运行（生产可换 gunicorn）
     from werkzeug.serving import run_simple
     run_simple("0.0.0.0", config.PORT, app, threaded=True, use_reloader=False)
