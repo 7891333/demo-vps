@@ -28,6 +28,8 @@ var (
 // ==================== 统计输出 ====================
 
 // ==================== sendmmsg 批量发送（性能关键） ====================
+// linux/amd64 的 sendmmsg 系统调用号
+const SYS_SENDMMSG = 307
 type iovec struct {
 	base *byte
 	len  uintptr
@@ -562,6 +564,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	dur := time.Duration(*duration) * time.Second
+	_ = bandwidth // 批量发送模式暂不支持限速
 	// 并行分片到多核
 	cores := runtime.NumCPU()
 	if *concurrency < cores {
