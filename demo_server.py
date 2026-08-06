@@ -123,7 +123,8 @@ def load_or_create():
         for a in rel.get("assets", []):
             if a.get("name") == ASSET_NAME:
                 status, blob = gh_request(
-                    "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}", raw=True
+                    "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}",
+                    raw=True, headers={"Accept": "application/octet-stream"}
                 )
                 if status == 200:
                     try:
