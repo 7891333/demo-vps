@@ -26,7 +26,8 @@ HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "90"))
 
 # ==================== 数据/文件 ====================
 DB_FILE = "demo.db"
-FILES_DIR = "files"
+# 持久化文件目录：~ 表示云端用户 home（/home/runner），比项目目录更上级、直观
+FILES_DIR = os.path.expanduser(os.environ.get("FILES_DIR", "~/files"))
 
 # ==================== 服务 ====================
 PORT = int(os.environ.get("PORT", "8080"))

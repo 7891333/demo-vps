@@ -179,14 +179,14 @@ def backup_files():
 
 
 def restore_files():
-    """还原 files/ 目录"""
+    """还原 files/ 目录（解包到主目录 ~/files）"""
     blob = download_asset(config.ASSET_FILES)
     if not blob:
         return
     try:
         data = decrypt(blob)
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            tar.extractall(path=".")
+            tar.extractall(path=os.path.expanduser("~"))
         os.makedirs(config.FILES_DIR, exist_ok=True)
         print(f"[files] 已恢复文件目录（{len(data)} 字节）", flush=True)
     except Exception as e:
