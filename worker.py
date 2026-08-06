@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作实例：WSS 终端 + API 命令执行 + 文件持久化 + 自动续命 + 状态上报"""
+"""工作实例：WSS 终端 + API 命令执行 + 文件持久化 + 自动续命 + 状态上报 + 系统瘦身"""
 import os
 import io
 import json
@@ -30,8 +30,42 @@ def init_instance():
     return cfg
 
 
+# ==================== 系统瘦身（省资源） ====================
+def _system_trim():
+    """
+    停用云环境用不到的服务，节省资源。
+    已实测验证不影响功能：health/exec/WSS/备份全部正常。
+    新实例启动自动执行。
+    """
+    services = [
+        # PHP（我们用不到）
+        "php8.3-fpm", "php8.2-fpm", "php8.1-fpm", "php-fpm",
+        # 云环境用不到的系统服务
+        "ModemManager",       # 调制解调器
+        "multipathd",         # 多路径存储
+        "walinuxagent",       # Azure 管理代理
+        "udisks2",            # 磁盘管理器
+        "getty@tty1",         # 物理登录终端
+        "serial-getty@ttyS0", # 串口登录终端
+        # Docker（GitHub runner 无需，已验证）
+        "docker", "containerd", "docker.socket",
+        # snap 包管理（无用）
+        "snapd", "snapd.socket", "snapd.seeded", "snapd.apparmor",
+        "snapd.core-fixup", "snapd.autoimport", "snapd.system-shutdown",
+        "snapd.snap-repair.timer",
+    ]
+    for svc in services:
+        try:
+            subprocess.run(f"sudo systemctl stop {svc} 2>/dev/null", shell=True, timeout=10)
+            subprocess.run(f"sudo systemctl disable {svc} 2>/dev/null", shell=True, timeout=10)
+        except Exception:
+            pass
+    print("[trim] 系统瘦身完成（停用无用服务）", flush=True)
+
+
+# ==================== 终端配置 ====================
 def _write_shell_profile():
-    """生成 .bashrc：PS1 显示 kodebite + 默认进入持久化目录 + 免密 sudo 提示"""
+    """生成 .bashrc：PS1 显示 kodebite + 默认进入持久化目录"""
     home = os.path.expanduser("~")
     persist = config.FILES_DIR
     os.makedirs(persist, exist_ok=True)
@@ -39,11 +73,8 @@ def _write_shell_profile():
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export TERM=xterm-256color
-# 主机名显示 kodebite
 export PS1='\\[\\e[32m\\]kodebite@kodebite\\[\\e[0m\\]:\\[\\e[34m\\]\\w\\[\\e[0m\\]\\$ '
-# 默认进入持久化目录
 cd {persist} 2>/dev/null || true
-# 提示 sudo 免密
 alias sudo='sudo '
 """
     try:
@@ -51,7 +82,6 @@ alias sudo='sudo '
             f.write(bashrc)
         with open(os.path.join(home, ".bash_profile"), "w") as f:
             f.write("source ~/.bashrc 2>/dev/null\n")
-        # 设置主机名
         subprocess.run("sudo hostname kodebite 2>/dev/null || hostname kodebite 2>/dev/null",
                        shell=True, timeout=5)
     except Exception as e:
@@ -59,7 +89,7 @@ alias sudo='sudo '
 
 
 def _run_setup():
-    """启动时执行 ~/files/setup.sh（自启动配置：内核参数、软件、用户等）"""
+    """启动时执行 ~/files/setup.sh（用户自定义自启动配置）"""
     setup = os.path.join(config.FILES_DIR, "setup.sh")
     if not os.path.exists(setup):
         return
@@ -171,14 +201,13 @@ def _pty_reader(session_key, sid):
                     sess.feed(data)
                     socketio.emit("output", data, to=sid)
             else:
-                # 检查 bash 是否退出（仅当真的退出才通知）
                 wpid, status = os.waitpid(sess.pid, os.WNOHANG)
                 if wpid == sess.pid:
                     socketio.emit("exit", {"code": status}, to=sid)
                     break
     except Exception:
         pass
-    # 注意：这里不关闭 fd，不杀进程。断线后 bash 继续存活，重连复用。
+    # 断开时不关闭 fd、不杀进程，bash 继续存活，重连复用
 
 
 @socketio.on("connect")
@@ -224,7 +253,7 @@ def ws_resize(data):
 def ws_disconnect():
     session_key = _sid_to_key.pop(request.sid, "")
     if session_key:
-        terminal.detach_session(session_key)  # 只标记，不杀进程
+        terminal.detach_session(session_key)
 
 
 # ==================== 后台线程 ====================
@@ -308,7 +337,9 @@ def run():
     os.makedirs(config.FILES_DIR, exist_ok=True)
     JOB_STATE["load_status"] = core.load_or_create()
     _write_shell_profile()
-    _run_setup()  # 后台执行 setup.sh（不阻塞启动）
+    # 系统瘦身 + 用户 setup（后台执行，不阻塞启动）
+    threading.Thread(target=_system_trim, daemon=True).start()
+    _run_setup()
     print(f"=== Worker 实例 {config.INSTANCE_ID} 启动 ===", flush=True)
     print(f"=== 固定域名: {config.TUNNEL_HOST} ===", flush=True)
     from core import LeaderLock
