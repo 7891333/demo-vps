@@ -65,10 +65,19 @@ def list_accounts(token=None):
 
 
 def _account_usage(account, workflow=None):
-    """查询账号当前 worker 运行数"""
+    """查询账号【自己仓库】当前 worker 运行数（并发检测）"""
     try:
-        running = core.count_running_runs(account.get("token"), workflow=workflow)
-        return running if running is not None else 0
+        repo = account.get("repo") or config.REPO
+        token = account.get("token")
+        url = f"https://api.github.com/repos/{repo}/actions/runs?status=in_progress&per_page=100"
+        status, data = core.gh_request("GET", url, token=token)
+        if status != 200:
+            return 0
+        runs = data.get("workflow_runs", [])
+        if workflow:
+            # path 形如 ".github/workflows/worker.yml"，用包含匹配
+            return sum(1 for r in runs if workflow in r.get("path", ""))
+        return len(runs)
     except Exception:
         return 0
 
