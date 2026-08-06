@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GitHub Actions 临时环境加密持久化演示站点核心脚本
+
+核心思路：利用 GitHub Actions 的 schedule 定时唤醒 + GitHub Releases 永久存储，
+实现无需本地守护进程的"云端自动续命 + 数据加密持久化"。
+- 启动时：从 GitHub Releases 拉取 AES-256-GCM 加密备份 -> 解密 -> 打开数据库
+- 运行中：后台线程定期把数据库加密后上传回 Releases
+- 6 小时到点销毁，数据已安全保存在 Releases 中，下个 schedule 自动恢复
+"""
+import os
+import sys
+import json
+import io
+import time
+import uuid
+import sqlite3
+import threading
+import datetime
+import subprocess
+import urllib.request
+import urllib.error
+import re
+
+from flask import Flask, request, jsonify, render_template_string
+
+# ==================== 配置 ====================
+REPO = os.environ.get("REPO", "7891333/demo-vps")
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+DEMO_KEY = os.environ.get("DEMO_KEY", "")
+BACKUP_TAG = "backup"
+ASSET_NAME = "demo.db.enc"
+DB_FILE = "demo.db"
+PORT = 8080
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))  # 秒
+
+# ==================== 加密工具 ====================
+def encrypt_file(data: bytes, key_hex: str) -> bytes:
+    """AES-256-GCM 加密，返回 nonce+tag+ciphertext"""
+    from Crypto.Cipher import AES
+    key = bytes.fromhex(key_hex)
+    cipher = AES.new(key, AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(data)
+    return cipher.nonce + tag + ciphertext
+
+def decrypt_file(blob: bytes, key_hex: str) -> bytes:
+    """AES-256-GCM 解密，校验完整性"""
+    from Crypto.Cipher import AES
+    key = bytes.fromhex(key_hex)
+    nonce, tag, ciphertext = blob[:16], blob[16:32], blob[32:]
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag)
+
+# ==================== GitHub Releases API ====================
+def gh_request(method, url, data=None, headers=None, raw=False):
+    h = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, method=method, headers=h)
+    body = None
+    if data is not None:
+        body = data if isinstance(data, bytes) else json.dumps(data).encode()
+    try:
+        with urllib.request.urlopen(req, body, timeout=30) as r:
+            content = r.read()
+            if raw:
+                return r.status, content
+            return r.status, json.loads(content.decode() or "null")
+    except urllib.error.HTTPError as e:
+        content = e.read()
+        try:
+            return e.code, json.loads(content.decode() or "null")
+        except Exception:
+            return e.code, content.decode(errors="replace")
+
+def get_release():
+    url = f"https://api.github.com/repos/{REPO}/releases/tags/{BACKUP_TAG}"
+    status, data = gh_request("GET", url)
+    return data if status == 200 else None
+
+def ensure_release():
+    rel = get_release()
+    if rel:
+        return rel["id"]
+    url = f"https://api.github.com/repos/{REPO}/releases"
+    data = {"tag_name": BACKUP_TAG, "name": "加密备份", "body": "AES-256-GCM 加密的数据库备份", "draft": False, "prerelease": False}
+    status, d = gh_request("POST", url, data=data)
+    return d.get("id")
+
+def download_asset_download_url(release_id):
+    url = f"https://api.github.com/repos/{REPO}/releases/{release['id']}" if False else None
+    return None
+
+def load_or_create():
+    """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
+    rel = get_release()
+    if rel:
+        for a in rel.get("assets", []):
+            if a.get("name") == ASSET_NAME:
+                url = f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}"
+                status, blob = gh_request("GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}", raw=True)
+                if status == 200:
+                    try:
+                        data = decrypt_file(blob, DEMO_KEY)
+                        with open(DB_FILE, "wb") as f:
+                            f.write(data)
+                        return f"已从 Releases 恢复加密备份（{len(data)} 字节，解密成功）"
+                    except Exception as e:
+                        return f"备份解密失败，改用新库: {e}"
+    return create_new_db()
+
+def create_new_db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('visits', '0')")
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?)", (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+    conn.commit()
+    conn.close()
+    return "新建了初始数据库"
+
+def backup_database():
+    """把当前数据库加密后上传到 Releases（覆盖旧备份）"""
+    with open(DB_FILE, "rb") as f:
+        data = f.read()
+    enc = encrypt_file(data, DEMO_KEY)
+    rel_id = ensure_release()
+    rel = get_release()
+    if rel:
+        for a in rel.get("assets", []):
+            if a.get("name") == ASSET_NAME:
+                gh_request("DELETE", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}")
+    url = f"https://api.github.com/repos/{REPO}/releases/{rel_id}/assets?name={ASSET_NAME}"
+    status, _ = gh_request("POST", url, data=enc, headers={"Content-Type": "application/octet-stream"})
+    return len(enc), status
+
+# ==================== Flask 站点 ====================
+app = Flask(__name__)
+JOB_ID = uuid.uuid4().hex[:8]
+START_TIME = datetime.datetime.now(datetime.timezone.utc)
+
+def get_conn():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def bump_visits():
+    conn = get_conn()
+    conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('visits', '0')")
+    conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'visits'")
+    conn.commit()
+    row = conn.execute("SELECT value FROM meta WHERE key='visits'").fetchone()
+    conn.close()
+    return int(row["value"])
+
+def elapsed_seconds():
+    return int((datetime.datetime.now(datetime.timezone.utc) - START_TIME).total_seconds())
+
+HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitHub Actions 加密持久化演示</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#f5f5f5;min-height:100vh}
+.wrap{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+header{padding:28px 0 20px;border-bottom:1px solid #2a2a2a;margin-bottom:24px}
+header h1{font-size:22px;font-weight:600;letter-spacing:0.5px;color:#fff}
+header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
+.badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:11px;font-weight:500;letter-spacing:0.3px;border:1px solid #333}
+.badge.green{color:#7ee787;border-color:#2a5e2a}
+.badge.gray{color:#aaa;border-color:#333}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
+.card{background:#1e1e1e;border:1px solid #2a2a2a;border-radius:6px;padding:18px}
+.card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
+.card .val{font-size:26px;font-weight:600;color:#fff;font-family:'SF Mono',Consolas,monospace}
+.card .sub{font-size:12px;color:#aaa;margin-top:6px}
+.card .mono{font-size:13px;color:#ccc;font-family:Consolas,monospace;word-break:break-all}
+.section{background:#1e1e1e;border:1px solid #2a2a2a;border-radius:6px;padding:20px;margin-bottom:24px}
+.section h2{font-size:14px;font-weight:600;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.section h2 .dot{width:6px;height:6px;border-radius:50%;background:#7ee787;display:inline-block}
+.list{list-style:none}
+.list li{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #2a2a2a;font-size:13px}
+.list li:last-child{border-bottom:none}
+.list .t{color:#f5f5f5;flex:1}
+.list .d{color:#888;font-size:12px;white-space:nowrap}
+.form{display:flex;gap:10px;margin-top:16px}
+.form input{flex:1;background:#111;border:1px solid #333;border-radius:4px;color:#fff;padding:10px 12px;font-size:13px;outline:none}
+.form input:focus{border-color:#666}
+.form button{background:#fff;color:#0a0a0a;border:none;border-radius:4px;padding:10px 18px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.form button:hover{opacity:.85}
+.form button:active{transform:scale(.97)}
+.foot{text-align:center;color:#555;font-size:11px;padding-top:20px;border-top:1px solid #1a1a1a}
+.foot .mono{font-family:Consolas,monospace}
+.enc{display:inline-flex;align-items:center;gap:6px;color:#7ee787;font-size:12px}
+.enc .lock{width:10px;height:10px;border:2px solid #7ee787;border-radius:2px;position:relative;display:inline-block}
+.enc .lock:after{content:'';position:absolute;left:-1px;top:-6px;width:8px;height:6px;border:2px solid #7ee787;border-bottom:none;border-radius:3px 3px 0 0}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:#2a2a2a;color:#fff;padding:12px 20px;border-radius:4px;font-size:13px;opacity:0;transition:all .3s;z-index:10}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+@media(max-width:520px){header h1{font-size:18px}.card .val{font-size:22px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <span class="badge green">AES-256-GCM 加密持久化</span>
+  <h1>GitHub Actions 临时环境演示</h1>
+  <p>利用 GitHub Actions 定时唤醒 + Releases 永久存储，实现无需本地守护进程的自动续传与数据加密持久化。</p>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">当前 Job</div>
+    <div class="val">{{ job_id }}</div>
+    <div class="sub">每次唤醒随机生成</div>
+  </div>
+  <div class="card">
+    <div class="label">运行时长</div>
+    <div class="val" id="elapsed">{{ elapsed }}s</div>
+    <div class="sub">本次 job 已运行</div>
+  </div>
+  <div class="card">
+    <div class="label">访问次数</div>
+    <div class="val">{{ visits }}</div>
+    <div class="sub">跨 job 累计，加密持久化</div>
+  </div>
+  <div class="card">
+    <div class="label">数据来源</div>
+    <div class="val" style="font-size:15px">{{ source }}</div>
+    <div class="sub">从 Releases 解密恢复</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="dot"></span>留言板（数据持久化验证）</h2>
+  <p style="font-size:12px;color:#888;margin-bottom:12px">在这里添加留言，数据会被 AES 加密后上传到 GitHub Releases，即使 job 销毁，下次唤醒也会自动恢复。</p>
+  <ul class="list" id="msglist">
+    {% for m in messages %}
+    <li><span class="t">{{ m.content }}</span><span class="d">{{ m.created_at }}</span></li>
+    {% else %}
+    <li><span class="t" style="color:#666">暂无留言，来添加第一条吧</span></li>
+    {% endfor %}
+  </ul>
+  <div class="form">
+    <input id="content" placeholder="输入留言内容..." maxlength="200">
+    <button onclick="addMsg()">添加</button>
+  </div>
+</div>
+
+<div class="section">
+  <h2><span class="dot"></span>安全与备份机制</h2>
+  <ul class="list">
+    <li><span class="t">加密算法</span><span class="d enc"><span class="lock"></span> AES-256-GCM</span></li>
+    <li><span class="t">密钥存储</span><span class="d">GitHub Secrets（不落盘）</span></li>
+    <li><span class="t">备份位置</span><span class="d">GitHub Releases</span></li>
+    <li><span class="t">自动备份间隔</span><span class="d">{{ backup_interval }} 秒</span></li>
+    <li><span class="t">job 生命周期</span><span class="d">~6 小时自动唤醒</span></li>
+  </ul>
+</div>
+
+<div class="foot">Job ID <span class="mono">{{ job_id }}</span> · 演示环境 · 数据加密后存于 Releases，仓库公开亦安全</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(function(){t.classList.remove('show')},2500)}
+function addMsg(){
+  var c=document.getElementById('content').value.trim();
+  if(!c){toast('请输入内容');return}
+  fetch('/api/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:c})})
+    .then(function(r){return r.json()})
+    .then(function(d){
+      if(d.ok){toast('已添加，并加密备份');setTimeout(function(){location.reload()},600)}
+      else{toast(d.error||'失败')}
+    }).catch(function(){toast('网络错误')});
+}
+setInterval(function(){
+  var el=document.getElementById('elapsed');
+  var s=parseInt(el.textContent)+1;
+  var h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
+  el.textContent=(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;
+},1000);
+</script>
+</body>
+</html>"""
+
+@app.route("/")
+def index():
+    v = bump_visits()
+    conn = get_conn()
+    msgs = [dict(r) for r in conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 50")]
+    conn.close()
+    return render_template_string(HTML, job_id=JOB_ID, elapsed=elapsed_seconds(), visits=v,
+                                  source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL)
+
+@app.route("/api/add", methods=["POST"])
+def add_msg():
+    data = request.get_json(silent=True) or {}
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify(ok=False, error="内容为空"), 400
+    if len(content) > 200:
+        return jsonify(ok=False, error="内容过长"), 400
+    conn = get_conn()
+    conn.execute("INSERT INTO messages (content, created_at) VALUES (?, ?)",
+                 (content, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.route("/api/backup", methods=["POST"])
+def manual_backup():
+    try:
+        size, status = backup_database()
+        return jsonify(ok=True, size=size, status=status)
+    except Exception as e:
+        return jsonify(ok=False, error=str(e)), 500
+
+@app.route("/api/health")
+def health():
+    return jsonify(ok=True, job_id=JOB_ID, elapsed=elapsed_seconds())
+
+# ==================== 后台备份线程 ====================
+def backup_loop():
+    while True:
+        time.sleep(BACKUP_INTERVAL)
+        try:
+            size, status = backup_database()
+            print(f"[backup] 已加密上传 {size} 字节 (HTTP {status})", flush=True)
+        except Exception as e:
+            print(f"[backup] 失败: {e}", flush=True)
+
+# ==================== Cloudflare 隧道 ====================
+def start_tunnel():
+    """启动 cloudflared quick tunnel，暴露公网地址"""
+    try:
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        # 解析公网 URL
+        for line in proc.stdout:
+            line = line.strip()
+            if "trycloudflare.com" in line:
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    print(f"[tunnel] 公网地址: {m.group(0)}", flush=True)
+                    break
+    except Exception as e:
+        print(f"[tunnel] 启动失败: {e}", flush=True)
+
+# ==================== main ====================
+if __name__ == "__main__":
+    print(f"=== Job ID: {JOB_ID} ===", flush=True)
+    print(f"=== 仓库: {REPO} ===", flush=True)
+    LOAD_STATUS = load_or_create()
+    print(f"=== 数据加载: {LOAD_STATUS} ===", flush=True)
+    threading.Thread(target=backup_loop, daemon=True).start()
+    threading.Thread(target=start_tunnel, daemon=True).start()
+    app.run(host="0.0.0.0", port=PORT)

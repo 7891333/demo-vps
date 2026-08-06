@@ -1,0 +1,40 @@
+name: demo-vps
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时自动唤醒一次，无需本地守护进程
+    - cron: '0 */6 * * *'
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    # 单 job 最长运行 6 小时（免费账户上限），到点销毁
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -sL -o /tmp/cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb || sudo apt-get install -y -f
+
+      - name: Run demo server
+        env:
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEMO_KEY: ${{ secrets.DEMO_KEY }}
+          BACKUP_INTERVAL: "45"
+        run: |
+          python3 demo_server.py
