@@ -39,7 +39,7 @@ jobs:
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
           TUNNEL_HOST: "ghvps.kekeke.cc.cd"
           BACKUP_INTERVAL: "45"
-          PRE_WAKE_SECONDS: "21000"
+          PRE_WAKE_SECONDS: "21300"
           HEARTBEAT_INTERVAL: "30"
           HEARTBEAT_TIMEOUT: "90"
         run: |

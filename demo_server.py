@@ -7,21 +7,30 @@ GitHub Actions 临时环境加密持久化演示站点核心脚本
 实现无需本地守护进程的"云端自动续命 + 数据加密持久化"。
 
 功能：
-- 启动时从 GitHub Releases 拉取 AES-256-GCM 加密备份并解密恢复
-- 后台线程定期把数据库加密后上传回 Releases（uploads.github.com 域名）
+- 启动时从 GitHub Releases 拉取 AES-256-GCM 加密备份（数据库 + 文件）并解密恢复
+- 后台线程定期把数据库和文件加密后上传回 Releases
 - Flask 演示站点（留言板，验证跨 job 持久化）
+- 【WSS 终端】/socket.io WebSocket 交互式终端（PTY），体验类似 SSH
+- 【文件持久化】云端 files/ 目录打包加密备份，job 销毁后自动恢复
 - Cloudflare 固定隧道（自定义域名 ghvps.kekeke.cc.cd），URL 自动上报仓库
 - 无缝衔接：job 到期前预触发下一个 job（PRE_WAKE_SECONDS），可用率 99.9%
-- 【主job锁】杜绝数据分叉：多 job 并行时仅 leader 写库+备份，follower 只读。
-  用 Releases 里的 leader.json 心跳文件作分布式锁，leader 心跳过期后 follower 自动升级接管。
+- 【主job锁】多 job 并行时仅 leader 写库+备份，follower 只读，杜绝数据分叉
 - 远程控制接口 /api/exec（带 EXEC_TOKEN 认证），可实时执行 shell 命令
 """
 import os
 import json
 import time
 import uuid
+import io
+import pty
+import tarfile
 import sqlite3
 import base64
+import select
+import signal
+import struct
+import termios
+import fcntl
 import threading
 import datetime
 import subprocess
@@ -30,6 +39,7 @@ import urllib.error
 import re
 
 from flask import Flask, request, jsonify, render_template_string
+from flask_socketio import SocketIO, emit
 
 # ==================== 配置 ====================
 REPO = os.environ.get("REPO", "7891333/demo-vps")
@@ -38,13 +48,15 @@ DEMO_KEY = os.environ.get("DEMO_KEY", "")
 EXEC_TOKEN = os.environ.get("EXEC_TOKEN", "")
 TUNNEL_TOKEN = os.environ.get("TUNNEL_TOKEN", "")  # Cloudflare 固定隧道凭证
 TUNNEL_HOST = os.environ.get("TUNNEL_HOST", "ghvps.kekeke.cc.cd")  # 固定域名
-PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))  # 到期前预唤醒（21000s=5h50m）
+PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21300"))  # 到期前预唤醒（21300s=5h55m）
 BACKUP_TAG = "backup"
 ASSET_NAME = "demo.db.enc"
+FILES_ASSET = "files.tar.gz.enc"  # 文件持久化备份
 LEADER_ASSET = "leader.json"  # 分布式锁心跳文件
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))  # 心跳间隔
 HEARTBEAT_TIMEOUT = int(os.environ.get("HEARTBEAT_TIMEOUT", "90"))  # 心跳过期判定
 DB_FILE = "demo.db"
+FILES_DIR = "files"  # 持久化文件目录（此目录下的文件会随备份保存）
 PORT = int(os.environ.get("PORT", "8080"))
 BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "45"))  # 秒
 
@@ -116,7 +128,7 @@ def ensure_release():
     data = {
         "tag_name": BACKUP_TAG,
         "name": "加密备份",
-        "body": "AES-256-GCM 加密的数据库备份（自动生成）",
+        "body": "AES-256-GCM 加密的数据库+文件备份（自动生成）",
         "draft": False,
         "prerelease": False,
     }
@@ -159,25 +171,7 @@ def download_asset(name):
     return None
 
 
-def load_or_create():
-    """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
-    global LOAD_STATUS
-    blob = download_asset(ASSET_NAME)
-    if blob:
-        try:
-            data = decrypt_file(blob, DEMO_KEY)
-            with open(DB_FILE, "wb") as f:
-                f.write(data)
-            LOAD_STATUS = f"从 Releases 恢复加密备份（{len(data)} 字节）"
-            print(f"[load] {LOAD_STATUS}", flush=True)
-            return
-        except Exception as e:
-            print(f"[load] 解密失败，改用新库: {e}", flush=True)
-    create_new_db()
-    LOAD_STATUS = "新建初始数据库"
-    print(f"[load] {LOAD_STATUS}", flush=True)
-
-
+# ==================== 数据/文件 恢复与备份 ====================
 def create_new_db():
     """创建初始数据库结构"""
     conn = sqlite3.connect(DB_FILE)
@@ -194,12 +188,67 @@ def create_new_db():
     conn.close()
 
 
+def load_or_create():
+    """从 Releases 拉取并解密数据库，若无备份则新建初始库"""
+    global LOAD_STATUS
+    blob = download_asset(ASSET_NAME)
+    if blob:
+        try:
+            data = decrypt_file(blob, DEMO_KEY)
+            with open(DB_FILE, "wb") as f:
+                f.write(data)
+            LOAD_STATUS = f"从 Releases 恢复加密备份（{len(data)} 字节）"
+            print(f"[load] {LOAD_STATUS}", flush=True)
+        except Exception as e:
+            print(f"[load] 解密失败，改用新库: {e}", flush=True)
+            create_new_db()
+            LOAD_STATUS = "新建初始数据库"
+    else:
+        create_new_db()
+        LOAD_STATUS = "新建初始数据库"
+        print(f"[load] {LOAD_STATUS}", flush=True)
+    # 恢复文件持久化目录
+    try:
+        restore_files()
+    except Exception as e:
+        print(f"[load] 文件恢复异常: {e}", flush=True)
+
+
 def backup_database():
     """把当前数据库加密后上传到 Releases（覆盖旧备份），返回 (大小, HTTP状态)"""
     with open(DB_FILE, "rb") as f:
         data = f.read()
     enc = encrypt_file(data, DEMO_KEY)
     return upload_asset(ASSET_NAME, enc)
+
+
+def backup_files():
+    """把 files/ 目录打包加密上传，无目录则跳过"""
+    if not os.path.isdir(FILES_DIR):
+        return None
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(FILES_DIR, arcname="files")
+    data = buf.getvalue()
+    enc = encrypt_file(data, DEMO_KEY)
+    size, status = upload_asset(FILES_ASSET, enc)
+    return size, status
+
+
+def restore_files():
+    """下载解密还原 files/ 目录"""
+    blob = download_asset(FILES_ASSET)
+    if not blob:
+        print("[files] 无历史文件备份，跳过", flush=True)
+        return
+    try:
+        data = decrypt_file(blob, DEMO_KEY)
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            tar.extractall(path=".")
+        os.makedirs(FILES_DIR, exist_ok=True)
+        print(f"[files] 已恢复文件持久化目录（{len(data)} 字节）", flush=True)
+    except Exception as e:
+        print(f"[files] 恢复失败: {e}", flush=True)
 
 
 # ==================== 主 job 锁（杜绝数据分叉） ====================
@@ -259,7 +308,6 @@ def follower_loop():
             now = time.time()
             if not leader or (now - leader.get("heartbeat", 0)) >= HEARTBEAT_TIMEOUT:
                 if acquire_leader():
-                    # 升级为 leader，重新拉取最新备份并启动备份线程
                     try:
                         load_or_create()
                         print("[leader] 升级后已重新拉取最新备份", flush=True)
@@ -329,6 +377,7 @@ def start_tunnel():
 
 # ==================== Flask 站点 ====================
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 
 def get_conn():
@@ -373,7 +422,7 @@ header h1{font-size:22px;font-weight:600;letter-spacing:0.5px;color:#fff}
 header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
 .badge{display:inline-block;padding:4px 12px;border-radius:4px;font-size:11px;font-weight:500;letter-spacing:0.3px;border:1px solid #333}
 .badge.green{color:#7ee787;border-color:#2a5e2a}
-.badge.amber{color:#ffab00;border-color:#5a4a00}
+.badge.orange{color:#ffab00;border-color:#5a4a00}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
 .card{background:#1e1e1e;border:1px solid #2a2a2a;border-radius:6px;padding:18px}
 .card .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}
@@ -421,7 +470,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
   </div>
   <div class="card">
     <div class="label">运行时长</div>
-    <div class="val" id="elapsed">{{ elapsed }}</div>
+    <div class="val" id="elapsed" data-sec="{{ elapsed_sec }}">{{ elapsed }}</div>
     <div class="sub">本次 job 已运行</div>
   </div>
   <div class="card">
@@ -460,6 +509,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
     <li><span class="t">备份位置</span><span class="d">GitHub Releases</span></li>
     <li><span class="t">自动备份间隔</span><span class="d">{{ backup_interval }} 秒</span></li>
     <li><span class="t">job 生命周期</span><span class="d">~6 小时 · 无缝衔接 · 主job锁</span></li>
+    <li><span class="t">文件持久化</span><span class="d">files/ 目录自动备份</span></li>
   </ul>
 </div>
 
@@ -482,7 +532,8 @@ function addMsg(){
 }
 setInterval(function(){
   var el=document.getElementById('elapsed');
-  var s=parseInt(el.textContent)+1;
+  var s=parseInt(el.getAttribute('data-sec'))+1;
+  el.setAttribute('data-sec', s);
   var h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
   el.textContent=(h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(sec<10?'0':'')+sec;
 },1000);
@@ -498,7 +549,7 @@ def index():
     msgs = [dict(r) for r in conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 50")]
     conn.close()
     return render_template_string(
-        HTML, job_id=JOB_ID, elapsed=elapsed_str(elapsed_seconds()), visits=v,
+        HTML, job_id=JOB_ID, elapsed=elapsed_str(elapsed_seconds()), elapsed_sec=elapsed_seconds(), visits=v,
         data_source=LOAD_STATUS, messages=msgs, backup_interval=BACKUP_INTERVAL,
         is_leader=IS_LEADER,
     )
@@ -530,7 +581,8 @@ def manual_backup():
         return jsonify(ok=False, error="当前为备份节点，不执行备份"), 503
     try:
         size, status = backup_database()
-        return jsonify(ok=True, size=size, status=status)
+        fsize, fstatus = backup_files()
+        return jsonify(ok=True, db_size=size, db_status=status, files_size=fsize, files_status=fstatus)
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
@@ -546,6 +598,7 @@ def api_status():
         ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(), leader=IS_LEADER,
         url=LAST_URL, source=LOAD_STATUS, backup_interval=BACKUP_INTERVAL,
         tunnel_host=TUNNEL_HOST, pre_wake=PRE_WAKE_SECONDS,
+        ws_terminal=True,
     )
 
 
@@ -573,6 +626,102 @@ def exec_cmd():
         return jsonify(ok=False, error=str(e)), 500
 
 
+# ==================== WSS 交互式终端（类 SSH） ====================
+active_ptys = {}  # sid -> (pid, fd)
+
+
+def pty_reader(sid, pid, fd):
+    """读取 PTY 输出并推送给客户端"""
+    try:
+        while True:
+            r, _, _ = select.select([fd], [], [], 1.0)
+            if r:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                socketio.emit("output", data.decode(errors="replace"), to=sid)
+            else:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    socketio.emit("exit", {"code": status}, to=sid)
+                    break
+    except Exception:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        active_ptys.pop(sid, None)
+
+
+@socketio.on("connect")
+def ws_connect(auth):
+    token = ""
+    if isinstance(auth, dict):
+        token = auth.get("token", "")
+    if not EXEC_TOKEN or token != EXEC_TOKEN:
+        print(f"[ws] 拒绝未授权连接: {request.sid}", flush=True)
+        return False
+    try:
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            os.execvp("/bin/bash", ["bash", "--login"])
+        active_ptys[request.sid] = (pid, fd)
+        threading.Thread(target=pty_reader, args=(request.sid, pid, fd), daemon=True).start()
+        print(f"[ws] 终端已连接: {request.sid}", flush=True)
+    except Exception as e:
+        print(f"[ws] 创建终端失败: {e}", flush=True)
+        return False
+
+
+@socketio.on("input")
+def ws_input(data):
+    item = active_ptys.get(request.sid)
+    if not item:
+        return
+    pid, fd = item
+    try:
+        payload = data.encode() if isinstance(data, str) else data
+        os.write(fd, payload)
+    except Exception:
+        pass
+
+
+@socketio.on("resize")
+def ws_resize(data):
+    item = active_ptys.get(request.sid)
+    if not item:
+        return
+    pid, fd = item
+    try:
+        rows = int(data.get("rows", 24))
+        cols = int(data.get("cols", 80))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
+
+
+@socketio.on("disconnect")
+def ws_disconnect():
+    item = active_ptys.pop(request.sid, None)
+    if item:
+        pid, fd = item
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    print(f"[ws] 终端断开: {request.sid}", flush=True)
+
+
 # ==================== 后台备份线程 ====================
 def backup_loop():
     while True:
@@ -581,9 +730,16 @@ def backup_loop():
             return
         try:
             size, status = backup_database()
-            print(f"[backup] 已加密上传 {size} 字节 (HTTP {status})", flush=True)
+            print(f"[backup] 数据库已加密上传 {size} 字节 (HTTP {status})", flush=True)
         except Exception as e:
-            print(f"[backup] 失败: {e}", flush=True)
+            print(f"[backup] 数据库备份失败: {e}", flush=True)
+        try:
+            res = backup_files()
+            if res:
+                size, status = res
+                print(f"[backup] 文件已加密上传 {size} 字节 (HTTP {status})", flush=True)
+        except Exception as e:
+            print(f"[backup] 文件备份失败: {e}", flush=True)
 
 
 # ==================== 无缝衔接：预触发下一个 job ====================
@@ -617,6 +773,7 @@ if __name__ == "__main__":
         print("[warn] EXEC_TOKEN 未设置，远程控制不可用", flush=True)
     if not TUNNEL_TOKEN:
         print("[warn] TUNNEL_TOKEN 未设置，回退 quick tunnel", flush=True)
+    os.makedirs(FILES_DIR, exist_ok=True)
     load_or_create()
     # 抢锁：决定本 job 是 leader（写+备份）还是 follower（只读）
     acquire_leader()
@@ -627,4 +784,4 @@ if __name__ == "__main__":
         threading.Thread(target=follower_loop, daemon=True).start()
     threading.Thread(target=start_tunnel, daemon=True).start()
     threading.Thread(target=pre_wake_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    socketio.run(app, host="0.0.0.0", port=PORT, allow_unsafe_werkzeug=True)
