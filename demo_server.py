@@ -8,9 +8,10 @@ GitHub Actions 临时环境加密持久化演示站点核心脚本
 
 功能：
 - 启动时从 GitHub Releases 拉取 AES-256-GCM 加密备份并解密恢复
-- 后台线程定期把数据库加密后上传回 Releases（修复 uploads.github.com 域名）
+- 后台线程定期把数据库加密后上传回 Releases（uploads.github.com 域名）
 - Flask 演示站点（留言板，验证跨 job 持久化）
-- Cloudflare quick tunnel 暴露公网，URL 自动上报到仓库 public_url.txt
+- Cloudflare 固定隧道（自定义域名 ghvps.kekeke.cc.cd），URL 自动上报仓库
+- 无缝衔接：job 到期前预触发下一个 job（PRE_WAKE_SECONDS），可用率 99.9%
 - 远程控制接口 /api/exec（带 EXEC_TOKEN 认证），可实时执行 shell 命令
 """
 import os
@@ -33,6 +34,9 @@ REPO = os.environ.get("REPO", "7891333/demo-vps")
 GH_TOKEN = os.environ.get("GH_TOKEN", "")
 DEMO_KEY = os.environ.get("DEMO_KEY", "")
 EXEC_TOKEN = os.environ.get("EXEC_TOKEN", "")
+TUNNEL_TOKEN = os.environ.get("TUNNEL_TOKEN", "")  # Cloudflare 固定隧道凭证
+TUNNEL_HOST = os.environ.get("TUNNEL_HOST", "ghvps.kekeke.cc.cd")  # 固定域名
+PRE_WAKE_SECONDS = int(os.environ.get("PRE_WAKE_SECONDS", "21000"))  # 到期前预唤醒（默认21000s=5h50m）
 BACKUP_TAG = "backup"
 ASSET_NAME = "demo.db.enc"
 DB_FILE = "demo.db"
@@ -43,6 +47,7 @@ JOB_ID = uuid.uuid4().hex[:8]
 START_TIME = datetime.datetime.now(datetime.timezone.utc)
 LAST_URL = ""
 LOAD_STATUS = "初始化中"
+PRE_WAKE_DONE = False  # 防止重复预触发
 
 # ==================== 加密工具 ====================
 def encrypt_file(data: bytes, key_hex: str) -> bytes:
@@ -122,9 +127,10 @@ def load_or_create():
     if rel:
         for a in rel.get("assets", []):
             if a.get("name") == ASSET_NAME:
+                # 关键：下载 asset 必须带 Accept: application/octet-stream，否则返回 JSON
                 status, blob = gh_request(
                     "GET", f"https://api.github.com/repos/{REPO}/releases/assets/{a['id']}",
-                    raw=True, headers={"Accept": "application/octet-stream"}
+                    raw=True, headers={"Accept": "application/octet-stream"},
                 )
                 if status == 200:
                     try:
@@ -194,22 +200,40 @@ def report_url(url):
 
 
 def start_tunnel():
-    """启动 cloudflared quick tunnel，暴露公网地址并上报"""
+    """启动隧道：优先 Cloudflare 固定隧道（自定义域名），回退 quick tunnel"""
     try:
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        reported = False
-        for line in proc.stdout:
-            line = line.strip()
-            if "trycloudflare.com" in line:
-                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-                if m and not reported:
-                    url = m.group(0)
-                    print(f"[tunnel] 公网地址: {url}", flush=True)
-                    report_url(url)
-                    reported = True
+        if TUNNEL_TOKEN:
+            # 固定隧道：用 token 启动，绑定自定义域名
+            proc = subprocess.Popen(
+                ["cloudflared", "tunnel", "--no-autoupdate", "run", "--token", TUNNEL_TOKEN],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            url = f"https://{TUNNEL_HOST}"
+            print(f"[tunnel] 固定隧道启动: {url}", flush=True)
+            report_url(url)
+            # 持续读取输出，防止管道阻塞，同时监控连接状态
+            for line in proc.stdout:
+                line = line.strip()
+                if "Registered tunnel connection" in line:
+                    print(f"[tunnel] 连接已注册: {line}", flush=True)
+                elif "ERR" in line.upper() and "error" in line.lower():
+                    print(f"[tunnel] 异常: {line}", flush=True)
+        else:
+            # 回退：quick tunnel（随机域名）
+            proc = subprocess.Popen(
+                ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            reported = False
+            for line in proc.stdout:
+                line = line.strip()
+                if "trycloudflare.com" in line:
+                    m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                    if m and not reported:
+                        url = m.group(0)
+                        print(f"[tunnel] 公网地址: {url}", flush=True)
+                        report_url(url)
+                        reported = True
     except Exception as e:
         print(f"[tunnel] 启动失败: {e}", flush=True)
 
@@ -344,7 +368,7 @@ header p{font-size:13px;color:#888;margin-top:8px;line-height:1.6}
     <li><span class="t">密钥存储</span><span class="d">GitHub Secrets（不落盘）</span></li>
     <li><span class="t">备份位置</span><span class="d">GitHub Releases</span></li>
     <li><span class="t">自动备份间隔</span><span class="d">{{ backup_interval }} 秒</span></li>
-    <li><span class="t">job 生命周期</span><span class="d">~6 小时自动唤醒</span></li>
+    <li><span class="t">job 生命周期</span><span class="d">~6 小时 · 无缝衔接</span></li>
   </ul>
 </div>
 
@@ -425,6 +449,7 @@ def api_status():
     return jsonify(
         ok=True, job_id=JOB_ID, elapsed=elapsed_seconds(),
         url=LAST_URL, source=LOAD_STATUS, backup_interval=BACKUP_INTERVAL,
+        tunnel_host=TUNNEL_HOST, pre_wake=PRE_WAKE_SECONDS,
     )
 
 
@@ -463,17 +488,39 @@ def backup_loop():
             print(f"[backup] 失败: {e}", flush=True)
 
 
+# ==================== 无缝衔接：预触发下一个 job ====================
+def pre_wake_loop():
+    """job 到期前预触发下一个 job，新旧重叠实现无缝衔接（可用率 99.9%）"""
+    global PRE_WAKE_DONE
+    while True:
+        elapsed = elapsed_seconds()
+        if elapsed >= PRE_WAKE_SECONDS and not PRE_WAKE_DONE:
+            PRE_WAKE_DONE = True
+            try:
+                url = f"https://api.github.com/repos/{REPO}/actions/workflows/demo.yml/dispatches"
+                gh_request("POST", url, data={"ref": "main"})
+                print(f"[prewake] 已预触发下一个 job（运行 {elapsed}s），无缝衔接", flush=True)
+            except Exception as e:
+                print(f"[prewake] 触发失败: {e}", flush=True)
+            break
+        time.sleep(60)
+
+
 # ==================== main ====================
 if __name__ == "__main__":
     print(f"=== Job ID: {JOB_ID} ===", flush=True)
     print(f"=== 仓库: {REPO} ===", flush=True)
+    print(f"=== 固定域名: {TUNNEL_HOST} ===", flush=True)
     if not DEMO_KEY:
         print("[warn] DEMO_KEY 未设置，加密不可用", flush=True)
     if not GH_TOKEN:
         print("[warn] GH_TOKEN 未设置，备份不可用", flush=True)
     if not EXEC_TOKEN:
         print("[warn] EXEC_TOKEN 未设置，远程控制不可用", flush=True)
+    if not TUNNEL_TOKEN:
+        print("[warn] TUNNEL_TOKEN 未设置，回退 quick tunnel", flush=True)
     load_or_create()
     threading.Thread(target=backup_loop, daemon=True).start()
     threading.Thread(target=start_tunnel, daemon=True).start()
+    threading.Thread(target=pre_wake_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)

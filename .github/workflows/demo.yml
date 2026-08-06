@@ -36,6 +36,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DEMO_KEY: ${{ secrets.DEMO_KEY }}
           EXEC_TOKEN: ${{ secrets.EXEC_TOKEN }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          TUNNEL_HOST: "ghvps.kekeke.cc.cd"
           BACKUP_INTERVAL: "45"
+          PRE_WAKE_SECONDS: "21000"
         run: |
           python3 demo_server.py
